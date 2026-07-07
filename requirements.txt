@@ -1,0 +1,9 @@
+# Project dependencies.
+
+# Garmin data ingestion (unofficial library, free) + env/config.
+garminconnect
+python-dotenv
+
+# Local dashboard: FastAPI app (no SPA, no auth, no external CDN).
+fastapi
+uvicorn
