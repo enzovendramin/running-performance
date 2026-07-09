@@ -75,9 +75,16 @@ def main() -> None:
 
     # --- Numeric foundation ---
     conn.execute(
-        "INSERT INTO daily_wellness (date, resting_hr, sleep_score, avg_stress,"
-        " body_battery_high, body_battery_low, vo2max, synced_at)"
-        " VALUES (?, 48, 82, 33, 95, 12, 61.0, ?)",
+        "INSERT INTO daily_wellness (date, resting_hr, sleep_score, sleep_seconds,"
+        " deep_sleep_seconds, light_sleep_seconds, rem_sleep_seconds, awake_sleep_seconds,"
+        " sleep_hr_avg, sleep_hr_min, avg_stress, body_battery_high, body_battery_low,"
+        " vo2max, synced_at)"
+        " VALUES (?, 48, 82, 23580, 1680, 13620, 8280, 180, 48, 43, 33, 95, 12, 61.0, ?)",
+        ("2026-07-05", now),
+    )
+    conn.execute(
+        "INSERT INTO race_prediction (date, time_5k_s, time_10k_s, time_half_s,"
+        " time_marathon_s, synced_at) VALUES (?, 1201, 2648, 6124, 13718, ?)",
         ("2026-07-05", now),
     )
     conn.execute(
@@ -107,6 +114,17 @@ def main() -> None:
 
     print("\n-- Load foundation (CTL/ATL/TSB) --")
     for row in conn.execute("SELECT * FROM daily_load"):
+        print(dict(row))
+
+    print("\n-- Sleep stages + overnight HR --")
+    for row in conn.execute(
+        "SELECT date, deep_sleep_seconds, light_sleep_seconds, rem_sleep_seconds,"
+        " awake_sleep_seconds, sleep_hr_avg, sleep_hr_min FROM daily_wellness"
+    ):
+        print(dict(row))
+
+    print("\n-- Race predictions (snapshot per day) --")
+    for row in conn.execute("SELECT * FROM race_prediction"):
         print(dict(row))
 
     # FK is enabled: a workout with a nonexistent plan must fail.

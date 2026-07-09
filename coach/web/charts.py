@@ -7,8 +7,11 @@ marks carry data-tip for hover. No external libs — inline SVG only.
 
 from __future__ import annotations
 
+import itertools
 from datetime import date
 from typing import Any
+
+_clip = itertools.count()  # unique clipPath ids across a rendered page
 
 
 def _sx(v, lo, hi, x0, x1):
@@ -135,10 +138,13 @@ def form_area(load: list[dict]) -> str:
 
 
 # ---------------------------------------- weekly/monthly volume w/ intensity --
-def volume_bars(items: list[dict], span_label: str) -> str:
-    """Stacked bars (easy/mod/hard km) per period, with hover breakdown."""
+def volume_bars(items: list[dict], span_label: str, *, pips: bool = False,
+                week_link: bool = False, selected: int | None = None) -> str:
+    """Stacked bars (easy/mod/hard km) per period, with hover breakdown. Optional:
+    pips (one dot per workout), a period-average line, and per-week click-through to
+    the week zoom (completed weeks only)."""
     W, H = 720, 300
-    ml, mr, mt, mb = 30, 12, 16, 40
+    ml, mr, mt, mb = 30, 12, 18, 46
     n = len(items)
     vmax = max((it["km"] for it in items), default=1) * 1.15 or 1
     x0, x1, y0, y1 = ml, W - mr, H - mb, mt
@@ -148,6 +154,12 @@ def volume_bars(items: list[dict], span_label: str) -> str:
         y = _sy(gv, 0, vmax, y0, y1)
         p.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" class="grid-l"/>')
         p.append(f'<text x="{ml-6}" y="{y+3:.1f}" class="tk tk-r">{gv}</text>')
+    active = [it["km"] for it in items if it["km"] > 0]
+    if active:
+        avg = sum(active) / len(active)
+        ya = _sy(avg, 0, vmax, y0, y1)
+        p.append(f'<line x1="{ml}" y1="{ya:.1f}" x2="{x1}" y2="{ya:.1f}" class="dash"/>')
+        p.append(f'<text x="{x1}" y="{ya-4:.1f}" class="note tk-r">média {avg:.0f} km</text>')
     for i, it in enumerate(items):
         cx = x0 + bw * i + bw / 2
         bwid = min(34, bw * 0.62)
@@ -156,20 +168,43 @@ def volume_bars(items: list[dict], span_label: str) -> str:
         else:
             tip = (f'<b>{it["label"]}</b><br>{it["km"]:.1f} km · {it["runs"]} treino(s)'
                    f'<br>fácil {it["easy"]:.0f} · mod {it["mod"]:.0f} · forte {it["hard"]:.0f} km')
+            stack = it["easy"] + it["mod"] + it["hard"]
+            bx, stop = cx - bwid / 2, _sy(stack, 0, vmax, y0, y1)
+            cid = f"vc{next(_clip)}"
+            g = [f'<clipPath id="{cid}"><rect x="{bx:.1f}" y="{stop:.1f}" width="{bwid:.1f}" '
+                 f'height="{max(0.5, y0-stop):.1f}" rx="3"/></clipPath>',
+                 f'<g clip-path="url(#{cid})">']
             base = y0
             for zk, cls in (("easy", "b-easy"), ("mod", "b-mod"), ("hard", "b-hard")):
                 seg = it[zk]
                 if seg <= 0:
                     continue
-                h = (base - _sy(seg, 0, vmax, y0, y1))
-                if base - h < base:
-                    top = base - h
-                    p.append(f'<rect x="{cx-bwid/2:.1f}" y="{top+1:.1f}" width="{bwid:.1f}" '
-                             f'height="{max(0.5,h-1):.1f}" rx="2.5" class="{cls} hoverable" data-tip="{tip}"/>')
-                    base = top
-            p.append(f'<text x="{cx:.1f}" y="{_sy(it["km"],0,vmax,y0,y1)-5:.1f}" class="note tk-m">{it["km"]:.0f}</text>')
-        p.append(f'<text x="{cx:.1f}" y="{H-22}" class="tk tk-m">{it["short"]}</text>')
-        p.append(f'<text x="{cx:.1f}" y="{H-9}" class="tk tk-m" opacity=".7">{it["runs"]}t</text>')
+                h = seg / vmax * (y0 - y1)  # pixel height for this segment's value
+                g.append(f'<rect x="{bx:.1f}" y="{base-h:.1f}" width="{bwid:.1f}" '
+                         f'height="{h:.1f}" class="{cls} hoverable" data-tip="{tip}"/>')
+                base -= h
+            g.append('</g>')
+            g.append(f'<text x="{cx:.1f}" y="{stop-5:.1f}" class="note tk-m">{it["km"]:.0f}</text>')
+            group = "".join(g)
+            if week_link and it.get("completed"):
+                p.append(f'<a href="/treinos?w={it["n"]}#semana" class="vol-a">{group}</a>')
+            else:
+                p.append(group)
+        if week_link and selected is not None and it.get("n") == selected:
+            p.append(f'<rect x="{cx-14:.1f}" y="{H-37:.0f}" width="28" height="16" rx="8" '
+                     f'class="tk-chip"/>')
+            p.append(f'<text x="{cx:.1f}" y="{H-26:.0f}" class="tk tk-m tk-sel">{it["short"]}</text>')
+        else:
+            p.append(f'<text x="{cx:.1f}" y="{H-26:.0f}" class="tk tk-m">{it["short"]}</text>')
+        if pips:
+            runs = it["runs"]
+            if runs > 0:
+                gap = min(6.0, bwid / runs)
+                startx = cx - (runs - 1) * gap / 2
+                for k in range(runs):
+                    p.append(f'<circle cx="{startx+k*gap:.1f}" cy="{H-12:.0f}" r="2" class="pip"/>')
+        else:
+            p.append(f'<text x="{cx:.1f}" y="{H-11:.0f}" class="tk tk-m" opacity=".7">{it["runs"]}t</text>')
     p.append("</svg>")
     return "".join(p)
 
@@ -232,14 +267,93 @@ def bb_range(rows: list[dict]) -> str:
     return "".join(p)
 
 
+# --------------------------------------------------- sleep stages per night --
+def sleep_stages(nights: list[dict]) -> str:
+    """Stacked bars per night (deep/light/REM/awake, in hours). Each night has a
+    full-height transparent hover target that feeds the fixed detail panel (JS)."""
+    if not nights:
+        return ('<p class="empty">Sem dados de sono no período — '
+                'noites sem o relógio não entram.</p>')
+    W, H = 560, 240
+    ml, mr, mt, mb = 28, 10, 16, 22
+    n = len(nights)
+    vmax = max((it["total_h"] for it in nights), default=1) * 1.15 or 1
+    x0, x1, y0, y1 = ml, W - mr, H - mb, mt
+    bw = (x1 - x0) / n
+    p = [_svg(W, H)]
+    for gv in range(0, int(vmax) + 1, 2):
+        y = _sy(gv, 0, vmax, y0, y1)
+        p.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" class="grid-l"/>')
+        p.append(f'<text x="{ml-6}" y="{y+3:.1f}" class="tk tk-r">{gv}h</text>')
+    last = n - 1
+    for i, it in enumerate(nights):
+        cx = x0 + bw * i + bw / 2
+        bwid = min(26, bw * 0.6)
+        bx, stop = cx - bwid / 2, _sy(it["total_h"], 0, vmax, y0, y1)
+        cid = f"sc{next(_clip)}"
+        p.append(f'<clipPath id="{cid}"><rect x="{bx:.1f}" y="{stop:.1f}" width="{bwid:.1f}" '
+                 f'height="{max(0.5, y0-stop):.1f}" rx="3"/></clipPath>')
+        p.append(f'<g clip-path="url(#{cid})">')
+        base = y0
+        for zk, cls in (("deep", "s-deep"), ("light", "s-light"),
+                        ("rem", "s-rem"), ("awake", "s-awake")):
+            seg = it[zk]
+            if seg <= 0:
+                continue
+            h = seg / vmax * (y0 - y1)  # pixel height for this segment's value
+            p.append(f'<rect x="{bx:.1f}" y="{base-h:.1f}" width="{bwid:.1f}" '
+                     f'height="{h:.1f}" class="{cls}"/>')
+            base -= h
+        p.append('</g>')
+        p.append(f'<text x="{cx:.1f}" y="{H-7}" class="tk tk-m">{it["short"]}</text>')
+        # full-column hover target carrying pre-formatted values for the side panel
+        p.append(
+            f'<rect x="{cx-bw/2:.1f}" y="{mt}" width="{bw:.1f}" height="{y0-mt:.1f}" '
+            f'fill="transparent" class="sleep-bar{" on" if i == last else ""}" '
+            f'data-date="{it["label"]}" data-total="{it["asleep_hm"]}" '
+            f'data-deep="{it["deep_hm"]}" data-light="{it["light_hm"]}" '
+            f'data-rem="{it["rem_hm"]}" data-awake="{it["awake_hm"]}" '
+            f'data-hravg="{it["hr_avg"] or ""}" data-hrmin="{it["hr_min"] or ""}"/>')
+    p.append("</svg>")
+    return "".join(p)
+
+
+# ------------------------------------------------- race prediction sparkline --
+def race_spark(vals: list[int]) -> str:
+    """Tiny trend line for one distance over time (faster time = higher)."""
+    vals = [v for v in vals if v]
+    if len(vals) < 2:
+        return ""
+    W, H, pad = 120, 26, 3
+    lo, hi = min(vals), max(vals)
+    x0, x1, y0, y1 = pad, W - pad, H - pad, pad
+    n = len(vals)
+    pts = " ".join(
+        f"{x0 + (x1-x0)*i/(n-1):.1f},"
+        f"{(y1 if hi == lo else y0 + (v-lo)/(hi-lo)*(y1-y0)):.1f}"
+        for i, v in enumerate(vals))
+    lx = x1
+    ly = y1 if hi == lo else y0 + (vals[-1]-lo)/(hi-lo)*(y1-y0)
+    return (f'<svg viewBox="0 0 {W} {H}" class="spark" preserveAspectRatio="none">'
+            f'<polyline points="{pts}" fill="none" class="l-spark"/>'
+            f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="2.2" fill="var(--accent)"/></svg>')
+
+
 # chart-specific stroke/fill styles (kept here so charts.py is self-contained)
 CHART_CSS = """
+.s-deep{fill:var(--seq-4)} .s-light{fill:var(--seq-2)} .s-rem{fill:var(--teal)}
+.s-awake{fill:var(--muted)}
+.sleep-bar{cursor:pointer} .sleep-bar.on{fill:var(--accent);opacity:.07}
+.l-spark{stroke:var(--accent);stroke-width:1.6;stroke-linejoin:round;stroke-linecap:round}
 .l-ctl{stroke:var(--accent);stroke-width:2.6;stroke-linejoin:round;stroke-linecap:round}
 .l-atl{stroke:var(--mod);stroke-width:1.8;stroke-linejoin:round;opacity:.85}
 .d-ctl{fill:var(--accent)} .d-atl{fill:var(--mod)}
 .a-pos{fill:var(--good);opacity:.20} .a-neg{fill:var(--alert);opacity:.16}
 .l-form{stroke:var(--ink-2);stroke-width:1.5;stroke-linejoin:round}
 .b-easy{fill:var(--easy)} .b-mod{fill:var(--mod)} .b-hard{fill:var(--hard)}
+.pip{fill:var(--accent);opacity:.5}
+.tk-chip{fill:var(--accent-weak)} .tk-sel{fill:var(--accent-strong);font-weight:700}
+.vol-a{cursor:pointer} .vol-a:hover{opacity:.82}
 .l-rhr{stroke:var(--violet);stroke-width:2;stroke-linejoin:round}
 .d-rhr{fill:var(--violet)} .d-hot{fill:var(--alert)}
 .bb-ok{fill:var(--good);opacity:.75} .bb-bad{fill:var(--alert);opacity:.85}

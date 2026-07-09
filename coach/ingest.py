@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from coach import garmin
@@ -132,15 +132,37 @@ def _sleep_seconds(sleep: dict[str, Any]) -> int | None:
     return int(secs) if isinstance(secs, (int, float)) and secs > 0 else None
 
 
+def _int(value: Any) -> int | None:
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def _overnight_hr(sleep: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Average and minimum heart rate from the overnight sleepHeartRate series."""
+    series = sleep.get("sleepHeartRate") or []
+    vals = [p["value"] for p in series
+            if isinstance(p, dict) and isinstance(p.get("value"), (int, float))]
+    if not vals:
+        return None, None
+    return round(sum(vals) / len(vals)), min(vals)
+
+
 def _extract_wellness(
     day: str, summary: dict[str, Any], sleep: dict[str, Any]
 ) -> dict[str, Any]:
     """Map the Garmin daily user summary + sleep to daily_wellness columns."""
+    dto = sleep.get("dailySleepDTO") or {}
+    hr_avg, hr_min = _overnight_hr(sleep)
     return {
         "date": day,
         "resting_hr": summary.get("restingHeartRate"),
         "sleep_score": None,  # not available on FR245 via this API — we use sleep_seconds
         "sleep_seconds": _sleep_seconds(sleep),
+        "deep_sleep_seconds": _int(dto.get("deepSleepSeconds")),
+        "light_sleep_seconds": _int(dto.get("lightSleepSeconds")),
+        "rem_sleep_seconds": _int(dto.get("remSleepSeconds")),
+        "awake_sleep_seconds": _int(dto.get("awakeSleepSeconds")),
+        "sleep_hr_avg": hr_avg,
+        "sleep_hr_min": hr_min,
         "avg_stress": summary.get("averageStressLevel"),
         "max_stress": summary.get("maxStressLevel"),
         "body_battery_high": summary.get("bodyBatteryHighestValue"),
@@ -152,23 +174,45 @@ def _extract_wellness(
 
 _UPSERT_WELLNESS = """
 INSERT INTO daily_wellness (
-    date, resting_hr, sleep_score, sleep_seconds, avg_stress, max_stress,
+    date, resting_hr, sleep_score, sleep_seconds,
+    deep_sleep_seconds, light_sleep_seconds, rem_sleep_seconds, awake_sleep_seconds,
+    sleep_hr_avg, sleep_hr_min, avg_stress, max_stress,
     body_battery_high, body_battery_low, vo2max, raw_json, synced_at
 ) VALUES (
-    :date, :resting_hr, :sleep_score, :sleep_seconds, :avg_stress, :max_stress,
+    :date, :resting_hr, :sleep_score, :sleep_seconds,
+    :deep_sleep_seconds, :light_sleep_seconds, :rem_sleep_seconds, :awake_sleep_seconds,
+    :sleep_hr_avg, :sleep_hr_min, :avg_stress, :max_stress,
     :body_battery_high, :body_battery_low, :vo2max, :raw_json, :now
 )
 ON CONFLICT(date) DO UPDATE SET
-    resting_hr        = excluded.resting_hr,
-    sleep_score       = excluded.sleep_score,
-    sleep_seconds     = excluded.sleep_seconds,
-    avg_stress        = excluded.avg_stress,
-    max_stress        = excluded.max_stress,
-    body_battery_high = excluded.body_battery_high,
-    body_battery_low  = excluded.body_battery_low,
-    vo2max            = excluded.vo2max,
-    raw_json          = excluded.raw_json,
-    synced_at         = excluded.synced_at;
+    resting_hr          = excluded.resting_hr,
+    sleep_score         = excluded.sleep_score,
+    sleep_seconds       = excluded.sleep_seconds,
+    deep_sleep_seconds  = excluded.deep_sleep_seconds,
+    light_sleep_seconds = excluded.light_sleep_seconds,
+    rem_sleep_seconds   = excluded.rem_sleep_seconds,
+    awake_sleep_seconds = excluded.awake_sleep_seconds,
+    sleep_hr_avg        = excluded.sleep_hr_avg,
+    sleep_hr_min        = excluded.sleep_hr_min,
+    avg_stress          = excluded.avg_stress,
+    max_stress          = excluded.max_stress,
+    body_battery_high   = excluded.body_battery_high,
+    body_battery_low    = excluded.body_battery_low,
+    vo2max              = excluded.vo2max,
+    raw_json            = excluded.raw_json,
+    synced_at           = excluded.synced_at;
+"""
+
+_UPSERT_RACE = """
+INSERT INTO race_prediction (
+    date, time_5k_s, time_10k_s, time_half_s, time_marathon_s, synced_at
+) VALUES (:date, :t5, :t10, :t21, :t42, :now)
+ON CONFLICT(date) DO UPDATE SET
+    time_5k_s       = excluded.time_5k_s,
+    time_10k_s      = excluded.time_10k_s,
+    time_half_s     = excluded.time_half_s,
+    time_marathon_s = excluded.time_marathon_s,
+    synced_at       = excluded.synced_at;
 """
 
 # VO2max is current fitness: ensure the profile row exists and refresh it.
@@ -217,8 +261,30 @@ def _maybe_escalate(conn: sqlite3.Connection, threshold: int = ESCALATION_THRESH
     conn.commit()
 
 
-def sync(days: int = 120, wellness_days: int = 60) -> dict[str, Any]:
-    """Run one sync cycle (activities + daily wellness). Return a result summary."""
+def _wellness_span(conn: sqlite3.Connection, max_days: int, overlap: int = 2) -> int:
+    """How many days of wellness to re-fetch, counting back from today.
+
+    Wellness rarely changes except for the last day or two (last night's sleep and
+    Body Battery only finalize the next morning), so an incremental sync just needs
+    the days since the newest stored one, plus a small overlap. Falls back to the
+    full window on an empty DB, and widens on its own to fill a gap after a lapse —
+    capped at `max_days`, since older days are outside the tracked window anyway.
+    """
+    row = conn.execute("SELECT MAX(date) AS d FROM daily_wellness").fetchone()
+    last = row["d"] if row else None
+    if not last:
+        return max_days
+    gap = (date.today() - date.fromisoformat(last)).days
+    return max(1, min(max_days, gap + overlap + 1))
+
+
+def sync(days: int = 120, wellness_days: int = 60,
+         wellness_backfill: int | None = None) -> dict[str, Any]:
+    """Run one sync cycle (activities + daily wellness). Return a result summary.
+
+    `wellness_backfill=N` re-fetches the last N wellness days (the manual backfill
+    repair), bypassing the incremental span; capped at `wellness_days`.
+    """
     conn = get_connection()
     try:
         try:
@@ -235,7 +301,9 @@ def sync(days: int = 120, wellness_days: int = 60) -> dict[str, Any]:
                 conn.execute(_UPSERT_ACTIVITY, row)
                 processed += 1
 
-            wellness = garmin.fetch_wellness(client, days=wellness_days)
+            span = (min(int(wellness_backfill), wellness_days) if wellness_backfill
+                    else _wellness_span(conn, wellness_days))
+            wellness = garmin.fetch_wellness(client, days=span)
             w_processed = 0
             for day, summary, sleep in wellness:
                 if not summary and not sleep:
@@ -251,6 +319,14 @@ def sync(days: int = 120, wellness_days: int = 60) -> dict[str, Any]:
                     _UPSERT_PROFILE_VO2,
                     {"vo2max": vo2max, "fitness_age": fitness_age, "now": now},
                 )
+
+            race = garmin.fetch_race_predictions(client)
+            if race:
+                conn.execute(_UPSERT_RACE, {
+                    "date": date.today().isoformat(),
+                    "t5": _int(race.get("time5K")), "t10": _int(race.get("time10K")),
+                    "t21": _int(race.get("timeHalfMarathon")),
+                    "t42": _int(race.get("timeMarathon")), "now": now})
             conn.commit()
 
             if not activities:

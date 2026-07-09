@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import sqlite3
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from coach import alerts as alertmod
@@ -69,8 +71,12 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
     load = [dict(r) for r in conn.execute(
         "SELECT date, daily_load, ctl, atl, tsb FROM daily_load ORDER BY date")]
     well = [dict(r) for r in conn.execute(
-        "SELECT date, resting_hr, sleep_seconds, body_battery_high, body_battery_low,"
-        " avg_stress FROM daily_wellness ORDER BY date")]
+        "SELECT date, resting_hr, sleep_seconds, deep_sleep_seconds, light_sleep_seconds,"
+        " rem_sleep_seconds, awake_sleep_seconds, sleep_hr_avg, sleep_hr_min,"
+        " body_battery_high, body_battery_low, avg_stress FROM daily_wellness ORDER BY date")]
+    races = [dict(r) for r in conn.execute(
+        "SELECT date, time_5k_s, time_10k_s, time_half_s, time_marathon_s"
+        " FROM race_prediction ORDER BY date")]
 
     # weekly (ISO) + monthly, each split by intensity zone
     def bucketize(keyfn, labelfn, shortfn):
@@ -86,7 +92,9 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
     weekly = []
     for n in range(11, 28):
         v = wk.get(n, {"km": 0.0, "runs": 0, "easy": 0.0, "mod": 0.0, "hard": 0.0})
-        weekly.append({"label": f"Semana {n}", "short": f"S{n}", "n": n, **v})
+        end = date.fromisocalendar(2026, n, 7)  # ISO Sunday of week n
+        weekly.append({"label": f"Semana {n}", "short": f"S{n}", "n": n,
+                       "end": end.isoformat(), "completed": end < date.today(), **v})
 
     mo = bucketize(lambda d: d.month, None, None)
     monthly = []
@@ -96,6 +104,22 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
 
     rhr = [w for w in well if w["resting_hr"] is not None][-40:]
     bb = [w for w in well if w["body_battery_high"] is not None][-18:]
+
+    sleep = []
+    # only nights with stage data (older nights predate the sleep-detail columns;
+    # a backfill fills them in) — avoids empty bars
+    for w in [x for x in well if x["deep_sleep_seconds"] is not None][-14:]:
+        sd = date.fromisoformat(w["date"])
+        deep, light = (w["deep_sleep_seconds"] or 0) / 3600, (w["light_sleep_seconds"] or 0) / 3600
+        rem, awake = (w["rem_sleep_seconds"] or 0) / 3600, (w["awake_sleep_seconds"] or 0) / 3600
+        sleep.append({
+            "label": f"{sd.day:02d}/{sd.month:02d}", "short": f"{sd.day:02d}",
+            "deep": deep, "light": light, "rem": rem, "awake": awake,
+            "total_h": deep + light + rem + awake,
+            "asleep_hm": _fmt_sleep(w["sleep_seconds"]), "deep_hm": _fmt_sleep(w["deep_sleep_seconds"]),
+            "light_hm": _fmt_sleep(w["light_sleep_seconds"]), "rem_hm": _fmt_sleep(w["rem_sleep_seconds"]),
+            "awake_hm": _fmt_sleep(w["awake_sleep_seconds"]),
+            "hr_avg": w["sleep_hr_avg"], "hr_min": w["sleep_hr_min"]})
 
     # active plan + per-day done flag (matched by an activity on that date)
     plan = conn.execute("SELECT * FROM weekly_plan WHERE status IN ('active','proposed')"
@@ -121,7 +145,8 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
     return {
         "profile": dict(prof) if prof else {},
         "runs": acts, "load": load, "weekly": weekly, "monthly": monthly,
-        "rhr": rhr, "bb": bb, "plan": plan, "pworkouts": pworkouts,
+        "rhr": rhr, "bb": bb, "sleep": sleep, "races": races,
+        "plan": plan, "pworkouts": pworkouts,
         "alerts": fired, "recovery": recovery,
         "totals": {"km": total_km, "runs": len(acts), "per_week": per_week,
                    "ctl": load[-1]["ctl"] if load else 0, "atl": load[-1]["atl"] if load else 0,
@@ -205,6 +230,45 @@ INTENSITY_LEGEND = (
     '<span><span class="key" style="background:var(--hard)"></span><b>forte</b> &gt;165 bpm</span></div>')
 
 
+def _hms(sec: int | None) -> str:
+    if not sec:
+        return "—"
+    sec = int(sec)
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _race_tile(lbl: str, key: str, races: list[dict[str, Any]]) -> str:
+    vals = [x[key] for x in races if x[key]]
+    delta = ""
+    if len(vals) >= 2:
+        d = vals[-1] - vals[-2]  # negative = faster than the previous snapshot
+        if d < 0:
+            delta = f'<span class="rt-dn good">▼ {_hms(-d)}</span>'
+        elif d > 0:
+            delta = f'<span class="rt-dn warn">▲ {_hms(d)}</span>'
+        else:
+            delta = '<span class="rt-dn muted">=</span>'
+    return (f'<div class="rtile"><div class="rt-d">{lbl}</div>'
+            f'<div class="rt-t mono">{_hms(races[-1][key])}</div>'
+            f'{delta}{charts.race_spark(vals)}</div>')
+
+
+def _race_card(races: list[dict[str, Any]]) -> str:
+    if not races:
+        return ('<div class="card"><h2>Previsões de prova</h2>'
+                '<p class="empty">Ainda sem previsão — aparece após o próximo sync.</p></div>')
+    tiles = "".join(_race_tile(lbl, key, races) for lbl, key in (
+        ("5 km", "time_5k_s"), ("10 km", "time_10k_s"),
+        ("21 km", "time_half_s"), ("42 km", "time_marathon_s")))
+    trend = ("<p class=\"hint\">Tempos que o Garmin projeta hoje — a linha mostra a evolução."
+             "</p>" if len(races) >= 2 else
+             "<p class=\"hint\">Tempos que o Garmin projeta hoje — a tendência aparece conforme"
+             " os dias acumulam.</p>")
+    return (f'<div class="card"><h2>Previsões de prova</h2>{trend}'
+            f'<div class="rgrid">{tiles}</div></div>')
+
+
 # ---------------------------------------------------------------- pages -------
 def page_overview(t: dict[str, Any]) -> str:
     g = build_gauges(t["totals"])
@@ -219,6 +283,7 @@ def page_overview(t: dict[str, Any]) -> str:
       <div class="card span2"><h2>Esta semana</h2><p class="hint">Plano ativo — verde = já feito.</p>
         {_plan_strip(t)}</div>
     </div>
+    <div style="margin-top:16px">{_race_card(t['races'])}</div>
     <div class="grid g2" style="margin-top:16px">
       <div class="card"><h2>Alertas &amp; recuperação</h2>{_alerts_block(t)}</div>
       <div class="card"><h2>Condição &amp; fadiga</h2>
@@ -241,9 +306,76 @@ def page_load(t: dict[str, Any]) -> str:
       <div class="fig">{charts.form_area(t['load'])}</div></div>"""
 
 
-def page_workouts(t: dict[str, Any]) -> str:
+ZONE_PT = {"easy": "fácil", "mod": "moderado", "hard": "forte", "na": "corrida"}
+
+
+def _kpi(label: str, val: str, sub: str) -> str:
+    return (f'<div class="card synccard"><div class="sc-label">{label}</div>'
+            f'<div class="sc-row"><span class="sc-val">{val}</span></div>'
+            f'<div class="sc-sub">{sub}</div></div>')
+
+
+def _workouts_kpis(weekly: list[dict[str, Any]]) -> str:
+    active = [w for w in weekly if w["runs"] > 0]
+    completed = [w for w in active if w["completed"]]
+    last = max(completed, key=lambda w: w["n"], default=None)
+    avg_km = sum(w["km"] for w in active) / len(active) if active else 0.0
+    avg_runs = sum(w["runs"] for w in active) / len(active) if active else 0.0
+    best = max(active, key=lambda w: w["km"], default=None)
+    if last:
+        d = last["km"] - avg_km
+        delta = f'{d:+.0f} km vs média' if abs(d) >= 0.5 else 'na média'
+        vol = _kpi("Volume · última semana", f'{last["km"]:.0f} km', f'Semana {last["n"]} · {delta}')
+        wk = _kpi("Treinos · última semana", f'{last["runs"]}', f'média {avg_runs:.1f}/semana')
+    else:
+        vol = _kpi("Volume · última semana", "—", "sem semana concluída")
+        wk = _kpi("Treinos · última semana", "—", "—")
+    avg = _kpi("Média por semana", f'{avg_km:.0f} km', f'sobre {len(active)} semanas ativas')
+    top = (_kpi("Semana mais forte", f'{best["km"]:.0f} km', f'Semana {best["n"]}')
+           if best else _kpi("Semana mais forte", "—", "—"))
+    return f'<div class="grid g4">{vol}{wk}{avg}{top}</div>'
+
+
+def _week_strip(runs: list[dict[str, Any]], week: int) -> str:
+    start, end = date.fromisocalendar(2026, week, 1), date.fromisocalendar(2026, week, 7)
+    header = f'Semana {week} · {_dm(start)}–{_dm(end)}'
+    if end >= date.today():
+        return (f'<div class="card" id="semana" style="margin-top:16px"><h2>{header}</h2>'
+                '<p class="empty">Semana em andamento — o resumo dos 7 dias abre quando ela '
+                'fechar (domingo).</p></div>')
+    by_day: dict[str, list[dict[str, Any]]] = {}
+    for r in runs:
+        if start <= r["d"] <= end:
+            by_day.setdefault(r["d"].isoformat(), []).append(r)
+    cells = []
+    for i in range(7):
+        dd = date.fromisocalendar(2026, week, i + 1)
+        wd = PT_WD[dd.weekday()]
+        day_runs = by_day.get(dd.isoformat(), [])
+        if day_runs:
+            r = max(day_runs, key=lambda x: x["km"])  # the day's main run
+            extra = f' +{len(day_runs)-1}' if len(day_runs) > 1 else ''
+            cells.append(
+                f'<div class="pday run done"><div class="pd">{wd} {dd.day:02d}</div>'
+                f'<div class="pt">{ZONE_PT.get(r["zone"], "corrida")}{extra}</div>'
+                f'<div class="pk">{r["km"]:.0f} km · {r["pace"] or "—"}</div></div>')
+        else:
+            cells.append(
+                f'<div class="pday rest"><div class="pd">{wd} {dd.day:02d}</div>'
+                '<div class="pt">descanso</div><div class="pk">&mdash;</div></div>')
+    return (f'<div class="card" id="semana" style="margin-top:16px"><h2>{header}</h2>'
+            '<p class="hint">O que você fez em cada dia — clique noutra semana no gráfico acima.</p>'
+            f'<div class="plan" style="margin-top:10px">{"".join(cells)}</div></div>')
+
+
+def page_workouts(t: dict[str, Any], week: str | None = None) -> str:
+    completed_ns = [w["n"] for w in t["weekly"] if w["completed"]]
+    sel = int(week) if (week or "").isdigit() and int(week) in completed_ns else None
+    if sel is None:
+        with_runs = [w["n"] for w in t["weekly"] if w["completed"] and w["runs"] > 0]
+        sel = max(with_runs, default=(max(completed_ns, default=None)))
+
     rows = []
-    zlab = {"easy": "fácil", "mod": "moderado", "hard": "forte", "na": "—"}
     for r in reversed(t["runs"]):
         ate = f'{r["aerobic_training_effect"]:.1f}' if r["aerobic_training_effect"] else "—"
         ana = f'{r["anaerobic_training_effect"]:.1f}' if r.get("anaerobic_training_effect") else "—"
@@ -252,7 +384,7 @@ def page_workouts(t: dict[str, Any]) -> str:
             f'<td class="mono num">{r["km"]}</td><td class="mono num">{r["pace"] or "—"}</td>'
             f'<td class="mono num">{r["avg_hr"] or "—"}/{r["max_hr"] or "—"}</td>'
             f'<td class="mono num">{ate}</td><td class="mono num">{ana}</td>'
-            f'<td><span class="pz pz-{r["zone"]}">{zlab[r["zone"]]}</span></td></tr>')
+            f'<td><span class="pz pz-{r["zone"]}">{ZONE_PT[r["zone"]] if r["zone"] != "na" else "—"}</span></td></tr>')
     table = ('<table class="tbl"><thead><tr><th>Data</th><th class="num">km</th>'
              '<th class="num">Ritmo</th><th class="num">FC m/máx</th>'
              '<th class="num" data-tip="Training Effect aeróbico do Garmin (0–5): quanto a '
@@ -260,23 +392,51 @@ def page_workouts(t: dict[str, Any]) -> str:
              '<th class="num" data-tip="Training Effect anaeróbico do Garmin (0–5): carga de '
              'alta intensidade / potência da corrida">TE anaer.</th>'
              f'<th>Zona</th></tr></thead><tbody>{"".join(rows)}</tbody></table>')
+    zoom = _week_strip(t["runs"], sel) if sel else ""
     return f"""
     <div class="pagehead"><p class="eyebrow">Treinos</p><h1>Volume &amp; intensidade</h1>
-      <p class="sub">Cada barra é um período, empilhada por intensidade. Os vazios contam a história.</p></div>
-    <div class="card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-      <h2 style="margin:0">Volume por período</h2>
+      <p class="sub">Volume por semana em primeiro plano — clique numa semana concluída para ver os 7 dias.</p></div>
+    {_workouts_kpis(t['weekly'])}
+    <div class="card" style="margin-top:16px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <h2 style="margin:0">Volume por semana</h2>
       <div class="seg"><button class="on" data-toggle="vol" data-view="week">Semana</button>
         <button data-toggle="vol" data-view="month">Mês</button></div></div>
       {INTENSITY_LEGEND}
-      <div class="fig" data-group="vol" data-view="week">{charts.volume_bars(t['weekly'], 'semana')}</div>
+      <div class="fig" data-group="vol" data-view="week">{charts.volume_bars(t['weekly'], 'semana', pips=True, week_link=True, selected=sel)}</div>
       <div class="fig" data-group="vol" data-view="month" style="display:none">{charts.volume_bars(t['monthly'], 'mês')}</div>
-      <p class="cap">Número embaixo de cada barra = treinos no período. Passe o mouse para o detalhe por zona.</p></div>
-    <div class="card" style="margin-top:16px"><h2>Todas as corridas</h2>
-      <div class="fig" style="overflow-x:auto">{table}</div>
-      <p class="cap">TE = Training Effect do Garmin (0–5): impacto aeróbico (resistência) e anaeróbico (alta intensidade) da corrida.</p></div>"""
+      <p class="cap">Pontos embaixo = treinos na semana · linha tracejada = média · clique numa semana para ampliar.</p></div>
+    {zoom}
+    <details class="allruns" style="margin-top:16px"><summary>Ver todas as corridas ({len(t['runs'])})</summary>
+      <div class="fig" style="overflow-x:auto;margin-top:12px">{table}</div>
+      <p class="cap">TE = Training Effect do Garmin (0–5): impacto aeróbico (resistência) e anaeróbico (alta intensidade).</p></details>"""
+
+
+def _sleep_panel_html(n: dict[str, Any]) -> str:
+    def row(cls: str, k: str, v: str) -> str:
+        return (f'<div class="sd-row"><span class="sd-k"><i class="sw {cls}"></i>{k}</span>'
+                f'<span class="sd-v">{_esc(v)}</span></div>')
+    return (f'<div class="sd-date">{_esc(n["label"])}</div>'
+            f'<div class="sd-total">dormiu <b>{_esc(n["asleep_hm"])}</b></div>'
+            '<div class="sd-rows">'
+            + row("s-deep", "profundo", n["deep_hm"]) + row("s-light", "leve", n["light_hm"])
+            + row("s-rem", "REM", n["rem_hm"]) + row("s-awake", "acordado", n["awake_hm"])
+            + '</div>'
+            f'<div class="sd-hr">FC noturna <b>{n["hr_avg"] or "—"}</b> bpm '
+            f'<span class="sd-min">(mín {n["hr_min"] or "—"})</span></div>')
 
 
 def page_recovery(t: dict[str, Any]) -> str:
+    nights = t["sleep"]
+    if nights:
+        sleep_body = (
+            '<div class="sleep-wrap">'
+            f'<div class="fig">{charts.sleep_stages(nights)}</div>'
+            f'<div class="sleep-detail" id="sleep-detail">{_sleep_panel_html(nights[-1])}</div>'
+            '</div>'
+            '<p class="cap">Passe o mouse numa noite para ver o detalhe ao lado. '
+            'Noites sem o relógio não aparecem.</p>')
+    else:
+        sleep_body = charts.sleep_stages(nights)
     return f"""
     <div class="pagehead"><p class="eyebrow">Recuperação</p><h1>Como o corpo respondeu</h1>
       <p class="sub">Um alerta real no fim de junho — e uma boa recuperação logo depois.</p></div>
@@ -288,7 +448,14 @@ def page_recovery(t: dict[str, Any]) -> str:
         <span><span class="key" style="background:var(--alert)"></span>dias depletados</span>
         <span><span class="key" style="background:var(--ink-2)"></span>estresse médio</span></div>
       <div class="fig">{charts.bb_range(t['bb'])}</div>
-      <p class="cap">Barra = amplitude da bateria no dia. Sono não aparece nos dias sem relógio.</p></div>"""
+      <p class="cap">Barra = amplitude da bateria no dia. Sono não aparece nos dias sem relógio.</p></div>
+    <div class="card" style="margin-top:16px"><h2>Sono — fases &amp; FC noturna</h2>
+      <div class="legend">
+        <span><span class="key" style="background:var(--seq-4)"></span><b>profundo</b></span>
+        <span><span class="key" style="background:var(--seq-2)"></span><b>leve</b></span>
+        <span><span class="key" style="background:var(--teal)"></span><b>REM</b></span>
+        <span><span class="key" style="background:var(--muted)"></span>acordado</span></div>
+      {sleep_body}</div>"""
 
 
 def page_reports(t: dict[str, Any]) -> str:
@@ -313,6 +480,237 @@ def page_reports(t: dict[str, Any]) -> str:
     </div><div class="rlist" style="margin-top:12px">{archive}</div></div>"""
 
 
+# ------------------------------------------------------------- sync page ------
+_MONTHS_ABBR = ["", "jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago",
+                "set", "out", "nov", "dez"]
+
+
+def _dm(d: date) -> str:
+    return f"{d.day:02d} {_MONTHS_ABBR[d.month]}"
+
+
+def _fmt_dt(iso: str | None) -> str:
+    """ISO UTC timestamp -> local 'DD/mon HH:MM'."""
+    try:
+        t = datetime.fromisoformat(iso).astimezone()  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return "—"
+    return f"{t.day:02d}/{_MONTHS_ABBR[t.month]} {t.strftime('%H:%M')}"
+
+
+def _fmt_sleep(secs: int | None) -> str:
+    if not secs:
+        return "—"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}"
+
+
+def _ago(iso: str | None) -> str:
+    """Portuguese relative time from an ISO timestamp (e.g. 'há 2 h')."""
+    if not iso:
+        return "nunca"
+    try:
+        t = datetime.fromisoformat(iso)
+    except ValueError:
+        return "—"
+    secs = max(0.0, (datetime.now(t.tzinfo) - t).total_seconds())
+    if secs < 90:
+        return "agora"
+    if secs < 5400:  # 90 min
+        return f"há {int(round(secs / 60))} min"
+    if secs < 129600:  # 36 h
+        return f"há {int(round(secs / 3600))} h"
+    return f"há {int(round(secs / 86400))} dias"
+
+
+def _hours_since(iso: str | None) -> float | None:
+    if not iso:
+        return None
+    try:
+        t = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    return (datetime.now(t.tzinfo) - t).total_seconds() / 3600
+
+
+def load_sync_data(conn: sqlite3.Connection) -> dict[str, Any]:
+    conn.row_factory = sqlite3.Row
+    today = date.today()
+
+    last = conn.execute(
+        "SELECT ran_at, status, source, detail, activities_fetched"
+        " FROM sync_log ORDER BY id DESC LIMIT 1").fetchone()
+    last_ok = conn.execute(
+        "SELECT ran_at FROM sync_log WHERE status='ok' ORDER BY id DESC LIMIT 1").fetchone()
+    history = [dict(r) for r in conn.execute(
+        "SELECT ran_at, status, source, detail FROM sync_log ORDER BY id DESC LIMIT 12")]
+
+    act = conn.execute(
+        "SELECT COUNT(*) AS n, MAX(start_time_local) AS last_dt, MAX(synced_at) AS synced"
+        " FROM activity WHERE type='running'").fetchone()
+    prof = conn.execute("SELECT vo2max, updated_at FROM user_profile WHERE id=1").fetchone()
+
+    span_days = 35
+    start = today - timedelta(days=span_days - 1)
+    wrows = {r["date"]: dict(r) for r in conn.execute(
+        "SELECT * FROM daily_wellness WHERE date >= ? ORDER BY date", (start.isoformat(),))}
+    w_last = conn.execute(
+        "SELECT MAX(date) AS d, MAX(synced_at) AS synced FROM daily_wellness").fetchone()
+    core_cols = ("resting_hr", "sleep_seconds", "body_battery_high", "avg_stress")
+    coverage, missing = [], 0
+    for i in range(span_days - 1, -1, -1):
+        dd = today - timedelta(days=i)
+        r = wrows.get(dd.isoformat())
+        if r is None or all(r[c] is None for c in core_cols):
+            state = "missing"  # no row, or an empty placeholder (today not yet finalized)
+            missing += 1
+        elif r["resting_hr"] is not None and r["sleep_seconds"] is not None:
+            state = "full"  # both night signals present
+        else:
+            state = "partial"  # some data, a signal missing (usually sleep)
+        coverage.append({"date": dd, "state": state, "row": r})
+
+    return {
+        "last": dict(last) if last else None,
+        "last_ok": last_ok["ran_at"] if last_ok else None,
+        "history": history,
+        "activities": {"n": act["n"], "last_dt": act["last_dt"], "synced": act["synced"]},
+        "vo2": {"value": prof["vo2max"] if prof else None,
+                "updated": prof["updated_at"] if prof else None},
+        "wellness": {"last": w_last["d"] if w_last else None,
+                     "synced": w_last["synced"] if w_last else None,
+                     "coverage": coverage, "missing": missing, "span": span_days},
+    }
+
+
+def _sync_header(d: dict[str, Any]) -> str:
+    last, last_ok = d["last"], d["last_ok"]
+    if not last:
+        cls, chip, head = "warn", "sem sync", "Nunca sincronizado"
+    elif last["status"] == "failed":
+        cls, chip, head = "alert", "falha", f"Falha no último sync · {_ago(last['ran_at'])}"
+    else:
+        h = _hours_since(last_ok)
+        if h is not None and h < 24:
+            cls, chip, head = "good", "atualizado", f"Sincronizado {_ago(last_ok)}"
+        elif h is not None and h < 72:
+            cls, chip, head = "warn", "defasado", f"Último sync {_ago(last_ok)}"
+        else:
+            cls, chip, head = "warn", "desatualizado", f"Último sync {_ago(last_ok)}"
+    dot = {"good": "var(--good)", "alert": "var(--alert)", "warn": "var(--warn)"}[cls]
+    backfill = "".join(
+        f'<form method="post" action="/sync?next=/sincronizacao&amp;wbf={n}"'
+        f' data-sync style="display:inline"><button class="pill ghost"'
+        f' style="cursor:pointer">{n}d</button></form>'
+        for n in (7, 14, 30, 60))
+    actions = (
+        '<form method="post" action="/sync?next=/sincronizacao" data-sync style="display:inline">'
+        '<button class="pill solid" style="border:0;cursor:pointer"'
+        ' data-progress="↻ Sincronizando…">↻ Sincronizar agora</button></form>'
+        '<span class="bf" data-tip="Re-busca o bem-estar (inclui as fases do sono) do zero,'
+        ' pelo período escolhido, para preencher lacunas">'
+        '<span class="bf-lbl">Re-buscar:</span>' + backfill + '</span>')
+    return (f'<div class="card"><div class="syncstate">'
+            f'<div class="ss-head"><span class="ss-dot" style="background:{dot}"></span>'
+            f'<div><div class="sc-label">Estado</div><h2>{_esc(head)}</h2></div>'
+            f'<span class="gtag t-{cls}">{chip}</span></div>'
+            f'<div class="ss-actions">{actions}</div></div></div>')
+
+
+def _domain_card(label: str, val: str, sub: str, tag: str | None = None,
+                 tagcls: str = "accent") -> str:
+    chip = f'<span class="gtag t-{tagcls}">{_esc(tag)}</span>' if tag else ""
+    return (f'<div class="card synccard"><div class="sc-label">{_esc(label)}</div>'
+            f'<div class="sc-row"><span class="sc-val">{_esc(val)}</span>{chip}</div>'
+            f'<div class="sc-sub">{sub}</div></div>')
+
+
+def _wellness_heatmap(cov: list[dict[str, Any]]) -> str:
+    cells = [f'<span class="hm-wd">{w}</span>'
+             for w in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]]
+    cells += ['<span class="hm-cell hm-pad"></span>'] * cov[0]["date"].weekday()
+    for c in cov:
+        r = c["row"]
+        if c["state"] == "missing" or not r:
+            detail = "sem dados"
+        else:
+            detail = (f'FC {r["resting_hr"] or "—"} · sono {_fmt_sleep(r["sleep_seconds"])}'
+                      f' · bateria {r["body_battery_high"] or "—"}→{r["body_battery_low"] or "—"}')
+        tip = f'{_dm(c["date"])} — {detail}'
+        cells.append(f'<span class="hm-cell hm-{c["state"]}" data-tip="{_esc(tip)}"></span>')
+    legend = ('<div class="legend" style="margin-top:12px">'
+              '<span><span class="key" style="background:var(--seq-3)"></span><b>completo</b></span>'
+              '<span><span class="key" style="background:var(--seq-1)"></span><b>parcial</b></span>'
+              '<span><span class="key" style="background:var(--surface-2);'
+              'border:1px solid var(--line)"></span>faltando</span></div>')
+    return f'<div class="hm">{"".join(cells)}</div>{legend}'
+
+
+_DETAIL_OK = re.compile(r"^(\d+) activities, (\d+) wellness days?$")
+
+
+def _pt_detail(detail: str | None) -> str:
+    """Localize the sync_log detail. The two numbers are different domains: activities
+    are the whole 120-day window; wellness is only the days re-fetched this run."""
+    if not detail:
+        return "—"
+    m = _DETAIL_OK.match(detail)
+    if m:
+        return f"{m.group(1)} atividades (120d) · {m.group(2)} dias de bem-estar"
+    return (detail.replace("login ok, 0 activities returned", "conectado, 0 atividades")
+                  .replace("activities", "atividades"))
+
+
+def _sync_history(history: list[dict[str, Any]]) -> str:
+    if not history:
+        return '<p class="empty">Nenhuma sincronização registrada ainda.</p>'
+    st = {"ok": ("ok", "good"), "failed": ("falha", "alert"), "suspicious": ("sem dados", "warn")}
+    src = {"garmin_sync": "Garmin", "manual_import": "importação"}
+    rows = []
+    for h in history:
+        lbl, cls = st.get(h["status"], (h["status"], "accent"))
+        rows.append(
+            f'<tr><td class="mono">{_fmt_dt(h["ran_at"])}</td>'
+            f'<td><span class="gtag t-{cls}">{lbl}</span></td>'
+            f'<td>{_esc(src.get(h["source"], h["source"]))}</td>'
+            f'<td>{_esc(_pt_detail(h["detail"]))}</td></tr>')
+    return ('<table class="tbl"><thead><tr><th>Quando</th><th>Status</th><th>Fonte</th>'
+            f'<th>Detalhe</th></tr></thead><tbody>{"".join(rows)}</tbody></table>')
+
+
+def page_sync(d: dict[str, Any]) -> str:
+    a = d["activities"]
+    act_last = date.fromisoformat(a["last_dt"][:10]) if a["last_dt"] else None
+    act_card = _domain_card(
+        "Atividades", _dm(act_last) if act_last else "—",
+        f'{a["n"]} corridas na janela · sync {_ago(a["synced"])}')
+
+    w = d["wellness"]
+    w_last = date.fromisoformat(w["last"]) if w["last"] else None
+    w_tag = f'{w["missing"]} sem dado' if w["missing"] else None
+    well_card = _domain_card(
+        "Wellness", _dm(w_last) if w_last else "—",
+        f'último dia · {w["missing"]} faltando em {w["span"]}d · sync {_ago(w["synced"])}',
+        tag=w_tag, tagcls="warn")
+
+    v = d["vo2"]
+    vo2_card = _domain_card(
+        "VO₂max", f'{v["value"]:.0f}' if v["value"] else "—", f'lido {_ago(v["updated"])}')
+
+    return f"""
+    <div class="pagehead"><p class="eyebrow">Dados</p><h1>Sincronização</h1>
+      <p class="sub">O que já entrou do Garmin e o que ainda falta — atividades, bem-estar e VO₂max.</p></div>
+    {_sync_header(d)}
+    <div class="grid g3" style="margin-top:16px">{act_card}{well_card}{vo2_card}</div>
+    <div class="grid g2" style="margin-top:16px">
+      <div class="card"><h2>Cobertura de bem-estar</h2>
+        <p class="hint">Últimos {w['span']} dias — passe o mouse em cada dia.</p>
+        {_wellness_heatmap(w['coverage'])}</div>
+      <div class="card"><h2>Histórico</h2>
+        <p class="hint">Últimas sincronizações e seu resultado.</p>
+        <div class="fig" style="overflow-x:auto">{_sync_history(d['history'])}</div></div>
+    </div>"""
+
+
 # ---------------------------------------------------------------- shell -------
 LOGO = ('<svg viewBox="0 0 100 100" width="22" height="22" fill="#fff" aria-hidden="true">'
         '<polygon points="49.8,43.0 53.8,27.3 48.4,4.0 44.6,27.6"/>'
@@ -329,7 +727,8 @@ LOGO = ('<svg viewBox="0 0 100 100" width="22" height="22" fill="#fff" aria-hidd
         '<polygon points="53.9,55.8 57.8,68.7 71.8,82.3 64.4,64.2"/>'
         '<polygon points="56.3,53.1 63.2,60.0 77.0,63.2 66.0,54.2"/></svg>')
 NAV = [("/", "Visão geral"), ("/carga", "Condição & carga"), ("/treinos", "Treinos"),
-       ("/recuperacao", "Recuperação"), ("/relatorios", "Relatórios")]
+       ("/recuperacao", "Recuperação"), ("/relatorios", "Relatórios"),
+       ("/sincronizacao", "Sincronização")]
 
 
 def shell(active: str, title: str, body: str) -> str:
@@ -341,27 +740,54 @@ def shell(active: str, title: str, body: str) -> str:
         '<div class="shell"><aside class="side">'
         '<div class="brand"><span class="mark">' + LOGO + '</span><b>Coach</b></div>'
         f'<nav class="nav">{nav}</nav>'
-        '<form method="post" action="/sync" style="margin-top:auto">'
-        '<button class="pill" style="border:0;cursor:pointer;width:100%">↻ Sincronizar</button></form>'
         '<div class="foot">Painel local · dados do Garmin</div>'
         f'</aside><main class="main">{body}</main></div>'
         f"<script>{JS}</script>")
 
 
-def _render(active: str, title: str, page_fn) -> str:
+def _render(active: str, title: str, page_fn, banner: str = "") -> str:
     conn = get_connection()
     try:
         run_migrations(conn)
         t = load_data(conn)
     finally:
         conn.close()
-    return shell(active, title, page_fn(t))
+    return shell(active, title, banner + page_fn(t))
+
+
+# --------------------------------------------------------------- feedback -----
+def _banner(kind: str, title: str, msg: str) -> str:
+    """A dismissible status banner (ok / warn / err), shown after a sync."""
+    return (f'<div class="banner b-{kind}" role="status">'
+            '<span class="bico"></span>'
+            f'<div class="btext"><b>{_esc(title)}</b><span>{msg}</span></div>'
+            '<button class="bx" type="button" aria-label="Fechar"'
+            " onclick=\"this.closest('.banner').remove()\">&times;</button></div>")
+
+
+def _sync_banner(qp: Any) -> str:
+    """Build the post-sync feedback banner from the redirect's query params."""
+    s = qp.get("sync")
+    if not s:
+        return ""
+    if s == "ok":
+        well = _esc(qp.get("well", "0"))
+        alerts = qp.get("alerts", "0")
+        extra = f" · {_esc(alerts)} alerta(s) novo(s)" if alerts not in ("0", "", None) else ""
+        return _banner("ok", "Sincronizado com o Garmin",
+                       f"Bem-estar: {well} dias · condição e alertas recalculados{extra}")
+    if s == "warn":
+        return _banner("warn", "Conectado, mas sem corridas novas",
+                       "O Garmin respondeu sem atividades no período. Tente de novo mais tarde.")
+    e = qp.get("e", "")
+    detail = f"Detalhe: {_esc(e)}" if e else "Verifique a conexão ou o login do Garmin."
+    return _banner("err", "Falha ao sincronizar", detail)
 
 
 # ---------------------------------------------------------------- routes ------
 @app.get("/", response_class=HTMLResponse)
-def home() -> str:
-    return _render("/", "Visão geral", page_overview)
+def home(request: Request) -> str:
+    return _render("/", "Visão geral", page_overview, _sync_banner(request.query_params))
 
 
 @app.get("/carga", response_class=HTMLResponse)
@@ -370,8 +796,15 @@ def carga() -> str:
 
 
 @app.get("/treinos", response_class=HTMLResponse)
-def treinos() -> str:
-    return _render("/treinos", "Treinos", page_workouts)
+def treinos(request: Request) -> str:
+    week = request.query_params.get("w")
+    conn = get_connection()
+    try:
+        run_migrations(conn)
+        t = load_data(conn)
+    finally:
+        conn.close()
+    return shell("/treinos", "Treinos", page_workouts(t, week))
 
 
 @app.get("/recuperacao", response_class=HTMLResponse)
@@ -382,6 +815,18 @@ def recuperacao() -> str:
 @app.get("/relatorios", response_class=HTMLResponse)
 def relatorios() -> str:
     return _render("/relatorios", "Relatórios", page_reports)
+
+
+@app.get("/sincronizacao", response_class=HTMLResponse)
+def sincronizacao(request: Request) -> str:
+    conn = get_connection()
+    try:
+        run_migrations(conn)
+        d = load_sync_data(conn)
+    finally:
+        conn.close()
+    return shell("/sincronizacao", "Sincronização",
+                 _sync_banner(request.query_params) + page_sync(d))
 
 
 @app.post("/relatorios/gerar")
@@ -402,10 +847,26 @@ def gerar_relatorio() -> RedirectResponse:
 
 
 @app.post("/sync")
-def sync() -> RedirectResponse:
+def sync(request: Request) -> RedirectResponse:
+    from coach.daily import run_daily
+    qp = request.query_params
+    nxt = qp.get("next")
+    base = nxt if nxt in ("/", "/sincronizacao") else "/"  # whitelist (no open redirect)
+    wbf = qp.get("wbf")
+    backfill = int(wbf) if wbf in ("7", "14", "30", "60") else None
     try:
-        from coach.daily import run_daily
-        run_daily()
-    except Exception:
-        pass
-    return RedirectResponse(url="/", status_code=303)
+        summary = run_daily(wellness_backfill=backfill)
+    except Exception as exc:  # a recompute stage failed unexpectedly
+        return RedirectResponse(
+            url=base + "?" + urlencode({"sync": "err", "e": type(exc).__name__}),
+            status_code=303)
+    s = summary.get("sync") or {}
+    status = s.get("status")
+    if status == "ok":
+        params = {"sync": "ok", "well": s.get("wellness_days", 0),
+                  "alerts": summary.get("alerts_new", 0)}
+    elif status == "suspicious":
+        params = {"sync": "warn"}
+    else:  # "failed"
+        params = {"sync": "err", "e": (s.get("error") or "")[:80]}
+    return RedirectResponse(url=base + "?" + urlencode(params), status_code=303)

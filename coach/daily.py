@@ -23,13 +23,13 @@ from coach.ingest import sync
 from coach.load import rebuild_load
 
 
-def run_daily() -> dict[str, Any]:
+def run_daily(wellness_backfill: int | None = None) -> dict[str, Any]:
     """Run one full update cycle and return a summary of each stage."""
     conn = get_connection()
     run_migrations(conn)
     conn.close()
 
-    sync_result = sync()  # opens/closes its own connection
+    sync_result = sync(wellness_backfill=wellness_backfill)  # opens/closes its own connection
 
     conn = get_connection()
     try:

@@ -144,9 +144,89 @@ h2{font-size:19px;letter-spacing:-.01em;margin:0 0 3px;font-weight:680}
 .pday.run{border-color:var(--accent-soft);background:var(--accent-weak)}
 .pday.done{border-color:var(--good)}
 
+/* ---- sync feedback banner ---- */
+.banner{display:flex;align-items:flex-start;gap:12px;padding:13px 16px;border-radius:14px;
+  border:1px solid var(--line);margin-bottom:18px;box-shadow:var(--shadow)}
+.banner .bico{width:9px;height:9px;border-radius:50%;margin-top:6px;flex:none}
+.banner .btext{display:flex;flex-direction:column;gap:1px}
+.banner .btext b{font-weight:680;font-size:14px}
+.banner .btext span{color:var(--ink-2);font-size:12.5px}
+.banner .bx{margin-left:auto;align-self:center;background:transparent;border:0;
+  color:var(--muted);font-size:18px;line-height:1;cursor:pointer;padding:0 4px}
+.banner .bx:hover{color:var(--ink)}
+.b-ok{background:var(--good-weak)} .b-ok .bico{background:var(--good)}
+.b-warn{background:var(--warn-weak)} .b-warn .bico{background:var(--warn)}
+.b-err{background:var(--alert-weak)} .b-err .bico{background:var(--alert)}
+
+/* ---- sync tab ---- */
+.gtag{display:inline-block;font-size:12.5px;font-weight:650;padding:2px 9px;border-radius:20px;
+  white-space:nowrap}
+.syncstate{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.syncstate .ss-head{display:flex;align-items:center;gap:12px}
+.syncstate .ss-dot{width:12px;height:12px;border-radius:50%;flex:none}
+.syncstate h2{margin:0}
+.syncstate .ss-actions{display:flex;gap:8px;flex-wrap:wrap}
+.pill.solid{background:var(--accent);color:#fff}
+.pill.ghost{background:transparent;border:1px solid var(--line);color:var(--ink-2)}
+.pill.ghost:hover{border-color:var(--accent-soft);color:var(--ink)}
+.bf{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
+.bf-lbl{font-size:12.5px;color:var(--muted)}
+.synccard .sc-label{font-size:12px;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--muted);font-weight:600}
+.synccard .sc-row{display:flex;align-items:baseline;gap:8px;margin:4px 0 2px}
+.synccard .sc-val{font-size:22px;font-weight:720;letter-spacing:-.01em}
+.synccard .sc-sub{color:var(--ink-2);font-size:12.5px}
+.hm{display:grid;grid-template-columns:repeat(7,1fr);gap:5px;margin-top:10px;max-width:340px}
+.hm-wd{font-size:10.5px;color:var(--muted);text-align:center;padding-bottom:2px}
+.hm-cell{aspect-ratio:1;border-radius:5px;background:var(--surface-2)}
+.hm-full{background:var(--seq-3)} .hm-partial{background:var(--seq-1)}
+.hm-missing{background:var(--surface-2);border:1px solid var(--line)}
+.hm-pad{background:transparent}
+.hm-cell[data-tip]{cursor:pointer}
+.hm-cell[data-tip]:hover{outline:2px solid var(--accent);outline-offset:1px}
+
+/* ---- race predictions ---- */
+.rgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}
+.rtile{background:var(--surface-2);border:1px solid var(--line);border-radius:12px;
+  padding:12px 14px;text-align:center}
+.rtile .rt-d{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;
+  font-weight:600}
+.rtile .rt-t{font-size:22px;font-weight:740;letter-spacing:-.01em;margin-top:2px}
+.rtile .rt-dn{display:inline-block;font-size:11.5px;font-weight:650;margin-top:2px}
+.rt-dn.good{color:var(--good)} .rt-dn.warn{color:var(--warn)} .rt-dn.muted{color:var(--muted)}
+.spark{width:100%;height:26px;display:block;margin-top:6px}
+
+/* ---- sleep detail panel ---- */
+.sleep-wrap{display:grid;grid-template-columns:1fr 210px;gap:16px;align-items:start;margin-top:8px}
+.sleep-wrap .fig{margin-top:0}
+.sleep-detail{background:var(--surface-2);border:1px solid var(--line);border-radius:12px;
+  padding:14px 16px}
+.sleep-detail .sd-date{font-size:12px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.04em;font-weight:600}
+.sleep-detail .sd-total{font-size:16px;margin:2px 0 10px}
+.sleep-detail .sd-rows{display:flex;flex-direction:column;gap:6px}
+.sleep-detail .sd-row{display:flex;justify-content:space-between;align-items:center;font-size:13px}
+.sleep-detail .sd-k{display:flex;align-items:center;gap:7px;color:var(--ink-2)}
+.sleep-detail .sd-v{font-variant-numeric:tabular-nums;font-weight:600}
+.sleep-detail .sw{width:10px;height:10px;border-radius:3px;display:inline-block;flex:none}
+.sw.s-deep{background:var(--seq-4)} .sw.s-light{background:var(--seq-2)}
+.sw.s-rem{background:var(--teal)} .sw.s-awake{background:var(--muted)}
+.sleep-detail .sd-hr{margin-top:10px;padding-top:10px;border-top:1px solid var(--line);font-size:13px}
+.sleep-detail .sd-min{color:var(--muted)}
+
+/* ---- collapsible (all runs) ---- */
+.allruns{background:var(--surface);border:1px solid var(--line);border-radius:16px;
+  padding:14px 20px;box-shadow:var(--shadow)}
+.allruns>summary{cursor:pointer;font-weight:680;font-size:15px;color:var(--ink);
+  list-style:none;display:flex;align-items:center;gap:8px}
+.allruns>summary::-webkit-details-marker{display:none}
+.allruns>summary::before{content:"\25B8";color:var(--accent);font-size:12px}
+.allruns[open]>summary::before{content:"\25BE"}
+
 /* ---- misc ---- */
 .pill{background:var(--surface-2);color:var(--ink-2);border-radius:20px;padding:2px 10px;
   font-size:12px;font-weight:600}
+.pill[disabled]{opacity:.65;cursor:progress}
 .alertrow{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border-radius:12px;
   background:var(--surface-2);border:1px solid var(--line);font-size:13.5px}
 .alertrow .dot{width:8px;height:8px;border-radius:50%;margin-top:6px;flex:none}
@@ -157,9 +237,10 @@ h2{font-size:19px;letter-spacing:-.01em;margin:0 0 3px;font-weight:680}
 .ritem:hover{border-color:var(--accent-soft)}
 
 #tip{position:fixed;z-index:50;pointer-events:none;background:var(--ink);color:var(--surface);
-  font-size:12px;padding:6px 9px;border-radius:8px;opacity:0;transition:opacity .08s;
-  max-width:220px;line-height:1.4;box-shadow:0 4px 14px rgba(0,0,0,.2)}
+  font-size:12.5px;padding:8px 11px;border-radius:9px;opacity:0;transition:opacity .08s;
+  max-width:260px;line-height:1.5;box-shadow:0 6px 20px rgba(0,0,0,.24)}
 #tip .mono{font-variant-numeric:tabular-nums}
+#tip b{font-weight:680}
 
 @media(max-width:820px){
   .shell{grid-template-columns:1fr}
@@ -169,8 +250,9 @@ h2{font-size:19px;letter-spacing:-.01em;margin:0 0 3px;font-weight:680}
   .nav{display:flex;flex-wrap:wrap;gap:2px}
   .g4,.g3,.g2{grid-template-columns:1fr 1fr} .span2{grid-column:span 2}
 }
+@media(max-width:640px){.sleep-wrap{grid-template-columns:1fr}}
 @media(max-width:520px){.g4,.g3,.g2{grid-template-columns:1fr}.span2{grid-column:span 1}
-  .plan{grid-template-columns:repeat(2,1fr)}}
+  .plan,.rgrid{grid-template-columns:repeat(2,1fr)}}
 """
 
 # Hover tooltip (any element with data-tip), and simple client-side view toggles.
@@ -188,6 +270,34 @@ JS = """
     el.addEventListener('mouseenter',show); el.addEventListener('mousemove',move);
     el.addEventListener('mouseleave',hide);});}
   document.addEventListener('DOMContentLoaded',bind);
+
+  // sync buttons: show progress while the (synchronous) daily cycle runs
+  document.querySelectorAll('form[data-sync]').forEach(function(sf){
+    sf.addEventListener('submit',function(){
+      var b=sf.querySelector('button'); if(!b)return;
+      setTimeout(function(){b.disabled=true;
+        var t=b.getAttribute('data-progress'); if(t)b.textContent=t;},0);
+    });
+  });
+
+  // sleep chart: hovering a night updates the fixed detail panel beside it
+  var sdp=document.getElementById('sleep-detail');
+  function sleepPanel(d){
+    function row(cls,k,v){return '<div class="sd-row"><span class="sd-k"><i class="sw '+cls
+      +'"></i>'+k+'</span><span class="sd-v">'+v+'</span></div>';}
+    return '<div class="sd-date">'+d.date+'</div><div class="sd-total">dormiu <b>'+d.total
+      +'</b></div><div class="sd-rows">'+row('s-deep','profundo',d.deep)
+      +row('s-light','leve',d.light)+row('s-rem','REM',d.rem)
+      +row('s-awake','acordado',d.awake)+'</div><div class="sd-hr">FC noturna <b>'
+      +(d.hravg||'—')+'</b> bpm <span class="sd-min">(mín '+(d.hrmin||'—')+')</span></div>';
+  }
+  document.querySelectorAll('.sleep-bar').forEach(function(el){
+    el.addEventListener('mouseenter',function(){
+      if(sdp) sdp.innerHTML=sleepPanel(el.dataset);
+      document.querySelectorAll('.sleep-bar.on').forEach(function(x){x.classList.remove('on');});
+      el.classList.add('on');
+    });
+  });
 
   // segmented toggles: button[data-toggle="groupId"][data-view="x"] shows [data-group][data-view]
   document.addEventListener('click',function(e){

@@ -80,6 +80,14 @@ def fetch_wellness(
     return out
 
 
+def fetch_race_predictions(client: Any) -> dict[str, Any] | None:
+    """Garmin's projected race times (5k/10k/half/marathon) — current snapshot."""
+    try:
+        return client.get_race_predictions() or None
+    except Exception:
+        return None
+
+
 def fetch_current_vo2max(client: Any) -> tuple[float | None, int | None]:
     """Current VO2max + fitness age (a slowly-changing profile metric)."""
     try:
