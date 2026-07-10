@@ -79,6 +79,7 @@ def _normalize_activity(a: dict[str, Any]) -> dict[str, Any]:
         "max_hr": a.get("maxHR"),
         "elevation_gain_m": a.get("elevationGain"),
         "elevation_loss_m": a.get("elevationLoss"),
+        "avg_cadence": a.get("averageRunningCadenceInStepsPerMinute"),
         "aerobic_training_effect": a.get("aerobicTrainingEffect"),
         "anaerobic_training_effect": a.get("anaerobicTrainingEffect"),
         "training_load": a.get("activityTrainingLoad"),
@@ -92,12 +93,12 @@ _UPSERT_ACTIVITY = """
 INSERT INTO activity (
     garmin_activity_id, start_time_utc, start_time_local, type, distance_m,
     duration_s, moving_duration_s, avg_speed, max_speed, avg_hr, max_hr,
-    elevation_gain_m, elevation_loss_m, aerobic_training_effect,
+    elevation_gain_m, elevation_loss_m, avg_cadence, aerobic_training_effect,
     anaerobic_training_effect, training_load, raw_json, synced_at, created_at
 ) VALUES (
     :garmin_activity_id, :start_time_utc, :start_time_local, :type, :distance_m,
     :duration_s, :moving_duration_s, :avg_speed, :max_speed, :avg_hr, :max_hr,
-    :elevation_gain_m, :elevation_loss_m, :aerobic_training_effect,
+    :elevation_gain_m, :elevation_loss_m, :avg_cadence, :aerobic_training_effect,
     :anaerobic_training_effect, :training_load, :raw_json, :now, :now
 )
 ON CONFLICT(garmin_activity_id) DO UPDATE SET
@@ -113,12 +114,69 @@ ON CONFLICT(garmin_activity_id) DO UPDATE SET
     max_hr                    = excluded.max_hr,
     elevation_gain_m          = excluded.elevation_gain_m,
     elevation_loss_m          = excluded.elevation_loss_m,
+    avg_cadence               = excluded.avg_cadence,
     aerobic_training_effect   = excluded.aerobic_training_effect,
     anaerobic_training_effect = excluded.anaerobic_training_effect,
     training_load             = excluded.training_load,
     raw_json                  = excluded.raw_json,
     synced_at                 = excluded.synced_at;
 """
+
+
+def _decoupling(laps: list[dict[str, Any]]) -> float | None:
+    """Aerobic decoupling (Pa:HR drift), % — efficiency (speed/HR) first vs second half.
+
+    Positive = the second half needed a higher HR for the same speed (aerobic drift);
+    it should trend down as the base improves. Needs at least 2 usable splits.
+    """
+    pts = [(lp["duration"], lp["distance"], lp["averageHR"]) for lp in laps
+           if lp.get("duration") and lp.get("distance") and lp.get("averageHR")]
+    if len(pts) < 2:
+        return None
+    total = sum(d for d, _, _ in pts)
+    half, acc, first, second = total / 2, 0.0, [], []
+    for dur, dist, hr in pts:
+        (first if acc + dur / 2 <= half else second).append((dur, dist, hr))
+        acc += dur
+
+    def ef(group: list[tuple[float, float, float]]) -> float | None:
+        if not group:
+            return None
+        dur = sum(d for d, _, _ in group)
+        dist = sum(x for _, x, _ in group)
+        hr = sum(d * h for d, _, h in group) / dur if dur else 0
+        return (dist / dur) / hr if dur and hr else None
+
+    ef1, ef2 = ef(first), ef(second)
+    if not ef1 or not ef2:
+        return None
+    return round((ef1 - ef2) / ef1 * 100, 1)
+
+
+def _enrich_activities(conn: sqlite3.Connection, client: Any, now: str) -> int:
+    """Fetch per-run HR zones + splits and store zones + decoupling. Only for runs not
+    enriched yet (decoupling_pct IS NULL), so it's a one-time cost per activity."""
+    rows = conn.execute(
+        "SELECT garmin_activity_id FROM activity"
+        " WHERE type='running' AND decoupling_pct IS NULL"
+    ).fetchall()
+    enriched = 0
+    for r in rows:
+        aid = r["garmin_activity_id"]
+        try:
+            zones = client.get_activity_hr_in_timezones(aid) or []
+            splits = client.get_activity_splits(aid) or {}
+        except Exception:
+            continue  # leave NULL, retry next sync
+        hz = [{"zone": z.get("zoneNumber"), "secs": z.get("secsInZone"),
+               "low": z.get("zoneLowBoundary")} for z in zones]
+        dec = _decoupling(splits.get("lapDTOs") or [])
+        conn.execute(
+            "UPDATE activity SET hr_zones_json=?, decoupling_pct=?, synced_at=?"
+            " WHERE garmin_activity_id=?",
+            (json.dumps(hz, ensure_ascii=False) if hz else None, dec, now, aid))
+        enriched += 1
+    return enriched
 
 
 def _sleep_seconds(sleep: dict[str, Any]) -> int | None:
@@ -327,6 +385,8 @@ def sync(days: int = 120, wellness_days: int = 60,
                     "t5": _int(race.get("time5K")), "t10": _int(race.get("time10K")),
                     "t21": _int(race.get("timeHalfMarathon")),
                     "t42": _int(race.get("timeMarathon")), "now": now})
+
+            _enrich_activities(conn, client, now)  # HR zones + decoupling for new runs
             conn.commit()
 
             if not activities:

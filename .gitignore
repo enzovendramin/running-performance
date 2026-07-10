@@ -21,6 +21,9 @@ ENV/
 # Generated report snapshots (personal data)
 reports/
 
+# Exported coach snapshots (personal data)
+exports/
+
 # Databases
 *.db
 *.db-wal

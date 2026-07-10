@@ -708,7 +708,12 @@ def page_sync(d: dict[str, Any]) -> str:
       <div class="card"><h2>Histórico</h2>
         <p class="hint">Últimas sincronizações e seu resultado.</p>
         <div class="fig" style="overflow-x:auto">{_sync_history(d['history'])}</div></div>
-    </div>"""
+    </div>
+    <div class="card" style="margin-top:16px"><h2>Exportar para o coach</h2>
+      <p class="hint">Gera o snapshot (estado + histórico recente + zonas, cadência, decoupling)
+        para colar no chat do coach.</p>
+      <a class="pill solid" style="display:inline-block;margin-top:10px;text-decoration:none;
+        border:0" href="/exportar">Gerar snapshot →</a></div>"""
 
 
 # ---------------------------------------------------------------- shell -------
@@ -827,6 +832,27 @@ def sincronizacao(request: Request) -> str:
         conn.close()
     return shell("/sincronizacao", "Sincronização",
                  _sync_banner(request.query_params) + page_sync(d))
+
+
+@app.get("/exportar", response_class=HTMLResponse)
+def exportar() -> str:
+    from coach.export import write_snapshot
+    path, text = write_snapshot()
+    body = (
+        '<div class="pagehead"><p class="eyebrow">Export</p><h1>Snapshot para o coach</h1>'
+        '<p class="sub">Cole no chat do coach — ou use o arquivo salvo abaixo.</p></div>'
+        '<div class="card"><div style="display:flex;justify-content:space-between;'
+        'align-items:center;gap:8px;flex-wrap:wrap"><h2 style="margin:0">snapshot.txt</h2>'
+        '<button class="pill solid" style="border:0;cursor:pointer" '
+        "onclick=\"navigator.clipboard.writeText(document.getElementById('snap').value);"
+        "this.textContent='Copiado!'\">Copiar tudo</button></div>"
+        f'<p class="hint">Salvo em: {_esc(str(path))}</p>'
+        '<textarea id="snap" readonly style="width:100%;height:58vh;margin-top:10px;'
+        'font-family:ui-monospace,monospace;font-size:12.5px;background:var(--inset);'
+        'color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:12px;'
+        f'resize:vertical">{_esc(text)}</textarea>'
+        '<p class="cap"><a href="/sincronizacao" style="color:var(--accent)">← voltar</a></p></div>')
+    return shell("/sincronizacao", "Export", body)
 
 
 @app.post("/relatorios/gerar")
