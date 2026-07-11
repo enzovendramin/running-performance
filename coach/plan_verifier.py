@@ -42,7 +42,9 @@ class Verdict:
 
 
 def _training_workouts(workouts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [w for w in workouts if not rules.is_rest(w.get("type"))]
+    """Running workouts only — rest and non-running support (strength/mobility/cross)
+    don't count toward running volume or reduce the required running-rest days."""
+    return [w for w in workouts if rules.is_running(w.get("type"))]
 
 
 def verify_plan(

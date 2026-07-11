@@ -17,9 +17,9 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from coach import alerts as alertmod
@@ -183,22 +183,121 @@ def build_gauges(t: dict[str, Any]) -> dict[str, str]:
 
 
 PT_TYPE = {"easy": "fácil", "long": "longo", "rest": "descanso", "tempo": "tempo",
-           "intervals": "tiros", "hard": "forte", "recovery": "regenerativo"}
+           "intervals": "tiros", "hard": "forte", "recovery": "regenerativo",
+           "threshold": "limiar", "fartlek": "fartlek", "hills": "ladeira", "race": "prova",
+           "off": "folga", "strength": "força", "mobility": "mobilidade", "cross": "cross"}
+
+
+def _plan_cat(typ: str) -> str:
+    if typ in ("rest", "off"):
+        return "rest"
+    if typ in ("strength", "mobility", "cross"):
+        return "support"
+    if typ in ("tempo", "intervals", "threshold", "repetitions", "fartlek", "hard", "race", "hills"):
+        return "quality"
+    return "run"
+
+
+def _fmt_pace_range(lo: float | None, hi: float | None) -> str | None:
+    def mmss(s: float) -> str:
+        s = int(s)
+        return f"{s // 60}:{s % 60:02d}"
+    if lo and hi:
+        return f"{mmss(lo)}–{mmss(hi)}"
+    return mmss(lo or hi) if (lo or hi) else None
+
+
+def _plan_metric(km: float | None, pace: str | None, hr: str | None) -> str:
+    """Labeled, divider-separated metric units (HTML) — scannable at a glance."""
+    def unit(label: str, value: str) -> str:
+        lbl = f'<span class="wk-mk">{label}</span>' if label else ""
+        return f'<span class="wk-m">{lbl}{value}</span>'
+    units = []
+    if km:
+        units.append(unit("", f'{("%g" % km).replace(".", ",")} km'))
+    if pace:
+        units.append(unit("ritmo", _esc(pace)))
+    if hr:
+        units.append(unit("FC", _esc(hr)))
+    return "".join(units)
+
+
+def _plan_detail(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<p class="empty">Nenhum plano ativo. Monte um na conversa com o coach.</p>'
+    out = []
+    for r in rows:
+        done = '<span class="wk-done">✓ feito</span>' if r.get("done") else ""
+        metric = f'<div class="wk-metric">{r["metric"]}</div>' if r.get("metric") else ""
+        note = f'<div class="wk-note">{_esc(r["note"])}</div>' if r.get("note") else ""
+        out.append(
+            f'<div class="wk-row"><div class="wk-day">{_esc(r["wd"])} {r["dd"]:02d}</div>'
+            f'<div class="wk-body"><div class="wk-head">'
+            f'<span class="wk-badge wk-{r["cat"]}">{_esc(r["label"])}</span>{done}</div>'
+            f'{metric}{note}</div></div>')
+    return '<div class="wk-list">' + "".join(out) + "</div>"
 
 
 def _plan_strip(t: dict[str, Any]) -> str:
     if not t["plan"] or not t["pworkouts"]:
         return '<p class="empty">Nenhum plano ativo. Monte um na conversa com o coach.</p>'
-    cells = []
+    rows = []
     for w in t["pworkouts"]:
         d = date.fromisoformat(w["date"])
-        wd = PT_WD[d.weekday()]
-        typ = PT_TYPE.get(w["type"], w["type"])
-        km = f'{w["target_distance_m"]/1000:.0f} km' if w["target_distance_m"] else "&mdash;"
-        cls = "rest" if w["type"] == "rest" else ("run done" if w["done"] else "run")
-        cells.append(f'<div class="pday {cls}"><div class="pd">{wd} {d.day:02d}</div>'
-                     f'<div class="pt">{typ}</div><div class="pk">{km}</div></div>')
-    return f'<div class="plan">{"".join(cells)}</div>'
+        cat = _plan_cat(w["type"])
+        km = w["target_distance_m"] / 1000 if w["target_distance_m"] else None
+        rows.append({
+            "wd": PT_WD[d.weekday()], "dd": d.day, "cat": cat,
+            "label": PT_TYPE.get(w["type"], w["type"]),
+            "metric": _plan_metric(km, _fmt_pace_range(
+                w["target_pace_low_s_km"], w["target_pace_high_s_km"]), w["target_intensity"]),
+            "note": w["description"], "done": w["done"] and cat in ("run", "quality")})
+    return _plan_detail(rows)
+
+
+_TYPE_EMOJI = {"strength": "💪", "mobility": "🧘", "cross": "🚴", "rest": "😴", "off": "😴"}
+
+
+def _whatsapp_plan_text(plan: dict[str, Any], pworkouts: list[dict[str, Any]]) -> str:
+    """Format the active plan as a WhatsApp-friendly message (plain text + *bold* + emoji)."""
+    ws = date.fromisoformat(plan["week_start_date"])
+    we = ws + timedelta(days=6)
+    rng = (f"{ws.day}–{we.day} {_MONTHS_ABBR[we.month]}" if ws.month == we.month
+           else f"{ws.day} {_MONTHS_ABBR[ws.month]}–{we.day} {_MONTHS_ABBR[we.month]}")
+    lines = [f"🗓️ *Semana {rng}*"]
+    if plan.get("rationale"):
+        lines.append(f"_{plan['rationale']}_")
+    lines.append("")
+    n_run, total_km, n_forca = 0, 0.0, 0
+    for w in pworkouts:
+        d = date.fromisoformat(w["date"])
+        cat = _plan_cat(w["type"])
+        emoji = _TYPE_EMOJI.get(w["type"]) or ("🔥" if cat == "quality" else "🏃")
+        head = f"*{PT_WD[d.weekday()]} {d.day:02d}* {emoji} {PT_TYPE.get(w['type'], w['type']).capitalize()}"
+        km = w["target_distance_m"] / 1000 if w["target_distance_m"] else None
+        if km:
+            head += f" · {('%g' % km).replace('.', ',')} km"
+            total_km += km
+        if cat in ("run", "quality"):
+            n_run += 1
+        if w["type"] == "strength":
+            n_forca += 1
+        lines.append(head)
+        pace = _fmt_pace_range(w["target_pace_low_s_km"], w["target_pace_high_s_km"])
+        metric = ([f"ritmo {pace}"] if pace else []) + \
+                 ([f"FC {w['target_intensity']}"] if w["target_intensity"] else [])
+        if metric:
+            lines.append(" · ".join(metric))
+        if w["description"]:
+            lines.append(f"_{w['description']}_")
+        lines.append("")
+    footer = [f"{n_run} corrida(s)"]
+    if total_km:
+        footer.append(f"{('%g' % round(total_km, 1)).replace('.', ',')} km")
+    if n_forca:
+        footer.append(f"{n_forca}× força")
+    lines += ["━━━━━━━━━━", "📊 " + " · ".join(footer)]
+    return "\n".join(lines)
 
 
 RECOVERY_PT = {
@@ -272,6 +371,18 @@ def _race_card(races: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------- pages -------
 def page_overview(t: dict[str, Any]) -> str:
     g = build_gauges(t["totals"])
+    wa_btn = ""
+    if t["plan"] and t["pworkouts"]:
+        watext = _whatsapp_plan_text(dict(t["plan"]), t["pworkouts"])
+        wa_btn = (
+            f'<textarea id="waText" hidden>{_esc(watext)}</textarea>'
+            '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+            '<a class="pill" style="background:#25D366;color:#fff;text-decoration:none;border:0"'
+            f' target="_blank" rel="noopener" href="https://wa.me/?text={quote(watext)}">'
+            'Enviar no WhatsApp</a>'
+            '<button class="pill ghost" style="cursor:pointer" onclick="'
+            "navigator.clipboard.writeText(document.getElementById('waText').value);"
+            "this.textContent='Copiado!'\">Copiar mensagem</button></div>")
     return f"""
     <div class="pagehead"><p class="eyebrow">Painel</p><h1>Visão geral</h1>
       <p class="sub">Motor de elite, base a reconstruir. O essencial num relance — passe o mouse nos gráficos.</p></div>
@@ -280,7 +391,11 @@ def page_overview(t: dict[str, Any]) -> str:
       <div class="card">{g['week']}</div><div class="card">{g['vo2']}</div>
     </div>
     <div class="grid g2" style="margin-top:16px">
-      <div class="card span2"><h2>Esta semana</h2><p class="hint">Plano ativo — verde = já feito.</p>
+      <div class="card span2">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <div><h2 style="margin:0">Esta semana</h2>
+            <p class="hint" style="margin-top:2px">Plano ativo — ✓ = já feito.</p></div>
+          {wa_btn}</div>
         {_plan_strip(t)}</div>
     </div>
     <div style="margin-top:16px">{_race_card(t['races'])}</div>
@@ -709,11 +824,18 @@ def page_sync(d: dict[str, Any]) -> str:
         <p class="hint">Últimas sincronizações e seu resultado.</p>
         <div class="fig" style="overflow-x:auto">{_sync_history(d['history'])}</div></div>
     </div>
-    <div class="card" style="margin-top:16px"><h2>Exportar para o coach</h2>
-      <p class="hint">Gera o snapshot (estado + histórico recente + zonas, cadência, decoupling)
-        para colar no chat do coach.</p>
-      <a class="pill solid" style="display:inline-block;margin-top:10px;text-decoration:none;
-        border:0" href="/exportar">Gerar snapshot →</a></div>"""
+    <div class="grid g2" style="margin-top:16px">
+      <div class="card"><h2>Exportar para o coach</h2>
+        <p class="hint">Gera o snapshot (estado + histórico + zonas, cadência, decoupling)
+          para colar no chat do coach.</p>
+        <a class="pill solid" style="display:inline-block;margin-top:10px;text-decoration:none;
+          border:0" href="/exportar">Gerar snapshot →</a></div>
+      <div class="card"><h2>Importar plano do coach</h2>
+        <p class="hint">Cola o plano (JSON) que o coach devolveu; o verificador aprova ou
+          bloqueia antes de gravar.</p>
+        <a class="pill ghost" style="display:inline-block;margin-top:10px;text-decoration:none"
+          href="/importar">Importar plano →</a></div>
+    </div>"""
 
 
 # ---------------------------------------------------------------- shell -------
@@ -853,6 +975,103 @@ def exportar() -> str:
         f'resize:vertical">{_esc(text)}</textarea>'
         '<p class="cap"><a href="/sincronizacao" style="color:var(--accent)">← voltar</a></p></div>')
     return shell("/sincronizacao", "Export", body)
+
+
+# ------------------------------------------------------------ plan import -----
+def _import_form(pasted: str = "") -> str:
+    return (
+        '<div class="card"><h2>Importar plano do coach</h2>'
+        '<p class="hint">Cole o bloco JSON que o coach devolveu. O verificador roda '
+        '<b>antes</b> de gravar — plano com violação não é persistido.</p>'
+        '<form method="post" action="/importar" data-sync>'
+        '<textarea name="plan" spellcheck="false" style="width:100%;height:30vh;margin-top:10px;'
+        'font-family:ui-monospace,monospace;font-size:12.5px;background:var(--inset);'
+        'color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:12px;'
+        f'resize:vertical">{_esc(pasted)}</textarea>'
+        '<button class="pill solid" style="border:0;cursor:pointer;margin-top:10px" '
+        'data-progress="Verificando…">Verificar e importar</button></form></div>')
+
+
+def _plan_result_html(result: dict[str, Any]) -> str:
+    ok = result["ok"]
+    kind, head = ("ok", "Plano verificado e importado — aguarda sua aprovação.") if ok \
+        else ("err", "Plano BLOQUEADO pelo verificador — nada foi gravado.")
+    parts = [f'<div class="banner b-{kind}" style="margin-top:16px"><span class="bico"></span>'
+             f'<div class="btext"><b>{_esc(result["badge"])}</b><span>{head}</span></div></div>']
+    for items, color, title in ((result["hard"], "--alert", "Bloqueios — corrija e reenvie ao coach"),
+                                (result["soft"], "--warn", "Avisos — passou, mas observe")):
+        if items:
+            rows = "".join(
+                f'<div class="alertrow"><span class="dot" style="background:var({color})"></span>'
+                f'<div>{_esc(i["message"])}</div></div>' for i in items)
+            parts.append(f'<div class="card" style="margin-top:12px"><h2>{title}</h2>'
+                         f'<div class="rlist" style="margin-top:8px">{rows}</div></div>')
+    if ok and result.get("plan_id"):
+        plan = result["plan"]
+        rows = []
+        for w in plan["workouts"]:
+            d = date.fromisoformat(w["date"])
+            lo, hi = w.get("pace_min_per_km"), w.get("pace_max_per_km")
+            pace = f"{lo}–{hi}" if lo and hi else (lo or hi)
+            rows.append({
+                "wd": PT_WD[d.weekday()], "dd": d.day, "cat": _plan_cat(w["type"]),
+                "label": PT_TYPE.get(w["type"], w["type"]),
+                "metric": _plan_metric(w.get("km"), pace, w.get("hr_target")),
+                "note": w.get("note")})
+        rat = f'<p class="hint">{_esc(plan["rationale"])}</p>' if plan.get("rationale") else ""
+        parts.append(
+            f'<div class="card" style="margin-top:12px"><h2>Semana de {_esc(plan["week_start"])} — proposta</h2>'
+            f'{rat}{_plan_detail(rows)}'
+            f'<form method="post" action="/importar/aprovar?id={result["plan_id"]}" style="margin-top:14px">'
+            '<button class="pill solid" style="border:0;cursor:pointer">Aprovar plano</button></form></div>')
+    return "".join(parts)
+
+
+def _page_import(form_html: str, result_html: str, banner: str = "") -> str:
+    return (f'{banner}<div class="pagehead"><p class="eyebrow">Import</p><h1>Importar plano</h1>'
+            '<p class="sub">Cole o plano do coach; o verificador aprova ou bloqueia antes de gravar.</p>'
+            f'</div>{form_html}{result_html}')
+
+
+@app.get("/importar", response_class=HTMLResponse)
+def importar_get(request: Request) -> str:
+    banner = (_banner("ok", "Plano aprovado", "Está ativo — o painel vai rastrear planejado vs. real.")
+              if request.query_params.get("ok") == "1" else "")
+    return shell("/sincronizacao", "Importar", _page_import(_import_form(), "", banner))
+
+
+@app.post("/importar", response_class=HTMLResponse)
+def importar_post(plan: str = Form("")) -> str:
+    from coach import plan_import
+    conn = get_connection()
+    try:
+        run_migrations(conn)
+        try:
+            result = plan_import.import_plan(conn, plan)
+            res_html = _plan_result_html(result)
+            pasted = "" if result["ok"] else plan
+        except ValueError as exc:
+            res_html = ('<div class="banner b-err" style="margin-top:16px"><span class="bico"></span>'
+                        f'<div class="btext"><b>Erro ao ler o plano</b><span>{_esc(str(exc))}</span>'
+                        '</div></div>')
+            pasted = plan
+    finally:
+        conn.close()
+    return shell("/sincronizacao", "Importar", _page_import(_import_form(pasted), res_html))
+
+
+@app.post("/importar/aprovar")
+def importar_aprovar(request: Request) -> RedirectResponse:
+    from coach import plan_import
+    pid = request.query_params.get("id")
+    if pid and pid.isdigit():
+        conn = get_connection()
+        try:
+            run_migrations(conn)
+            plan_import.approve_plan(conn, int(pid))
+        finally:
+            conn.close()
+    return RedirectResponse(url="/importar?ok=1", status_code=303)
 
 
 @app.post("/relatorios/gerar")

@@ -214,6 +214,28 @@ h2{font-size:19px;letter-spacing:-.01em;margin:0 0 3px;font-weight:680}
 .sleep-detail .sd-hr{margin-top:10px;padding-top:10px;border-top:1px solid var(--line);font-size:13px}
 .sleep-detail .sd-min{color:var(--muted)}
 
+/* ---- plan detail (weekly plan with notes) ---- */
+.wk-list{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.wk-row{display:flex;gap:14px;padding:11px 14px;border:1px solid var(--line);
+  border-radius:12px;background:var(--surface-2)}
+.wk-day{flex:none;width:60px;font-size:12px;color:var(--muted);font-weight:650;
+  text-transform:uppercase;letter-spacing:.03em;padding-top:3px}
+.wk-body{flex:1;min-width:0}
+.wk-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.wk-badge{font-size:12px;font-weight:650;padding:2px 10px;border-radius:20px;white-space:nowrap}
+.wk-run{background:var(--accent-weak);color:var(--accent-strong)}
+.wk-support{background:var(--good-weak);color:var(--teal)}
+.wk-quality{background:var(--warn-weak);color:var(--warn)}
+.wk-rest{background:var(--surface);color:var(--muted);border:1px solid var(--line)}
+.wk-metric{display:flex;flex-wrap:wrap;align-items:baseline;margin-top:6px}
+.wk-m{font-size:13.5px;color:var(--ink);font-weight:640;font-variant-numeric:tabular-nums;
+  padding:0 13px;border-left:1px solid var(--line);white-space:nowrap}
+.wk-m:first-child{padding-left:0;border-left:0}
+.wk-mk{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;
+  font-weight:700;margin-right:6px}
+.wk-done{font-size:11.5px;color:var(--good);font-weight:650}
+.wk-note{font-size:12.5px;color:var(--ink-2);margin-top:5px;line-height:1.45}
+
 /* ---- collapsible (all runs) ---- */
 .allruns{background:var(--surface);border:1px solid var(--line);border-radius:16px;
   padding:14px 20px;box-shadow:var(--shadow)}

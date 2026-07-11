@@ -31,6 +31,9 @@ SLEEP_SHORT_S = 6 * 3600   # under 6 h
 QUALITY_TYPES = frozenset({"tempo", "intervals", "threshold", "repetitions",
                            "fartlek", "hard", "race", "hills"})
 REST_TYPES = frozenset({"rest", "off"})
+# Non-running support work — no running load, so it counts as a running-rest day for
+# the plan rules, but is shown distinctly (not "rest").
+SUPPORT_TYPES = frozenset({"strength", "mobility", "cross"})
 
 
 def is_quality(workout_type: str | None) -> bool:
@@ -39,6 +42,15 @@ def is_quality(workout_type: str | None) -> bool:
 
 def is_rest(workout_type: str | None) -> bool:
     return (workout_type or "").lower() in REST_TYPES
+
+
+def is_support(workout_type: str | None) -> bool:
+    return (workout_type or "").lower() in SUPPORT_TYPES
+
+
+def is_running(workout_type: str | None) -> bool:
+    """A running workout (adds running load) — not rest and not support."""
+    return not is_rest(workout_type) and not is_support(workout_type)
 
 
 # --- Athlete phase (drives how conservative the plan rules are) ---
