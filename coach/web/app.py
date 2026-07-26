@@ -68,6 +68,15 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
         a["pace"] = _pace(a["avg_speed"])
         a["zone"] = _zone(a["avg_hr"])
 
+    # cross-training (non-running) — shown as a labeled "day off" in the week zoom
+    cross = [dict(r) for r in conn.execute(
+        "SELECT start_time_local, type, distance_m, duration_s FROM activity"
+        " WHERE type != 'running' ORDER BY start_time_local")]
+    for a in cross:
+        a["d"] = date.fromisoformat(a["start_time_local"][:10])
+        a["km"] = (a["distance_m"] or 0) / 1000
+        a["min"] = round((a["duration_s"] or 0) / 60)
+
     load = [dict(r) for r in conn.execute(
         "SELECT date, daily_load, ctl, atl, tsb FROM daily_load ORDER BY date")]
     well = [dict(r) for r in conn.execute(
@@ -89,12 +98,19 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
         return b
 
     wk = bucketize(lambda d: d.isocalendar()[1], None, None)
+    iso_year, cur_wk = date.today().isocalendar()[0], date.today().isocalendar()[1]
+    first_wk = min((a["d"].isocalendar()[1] for a in acts
+                    if a["d"].isocalendar()[0] == iso_year), default=cur_wk)
     weekly = []
-    for n in range(11, 28):
+    for n in range(max(first_wk, cur_wk - 19), cur_wk + 1):  # rolling window up to this week
         v = wk.get(n, {"km": 0.0, "runs": 0, "easy": 0.0, "mod": 0.0, "hard": 0.0})
-        end = date.fromisocalendar(2026, n, 7)  # ISO Sunday of week n
-        weekly.append({"label": f"Semana {n}", "short": f"S{n}", "n": n,
-                       "end": end.isoformat(), "completed": end < date.today(), **v})
+        seg = date.fromisocalendar(iso_year, n, 1)   # ISO Monday
+        end = date.fromisocalendar(iso_year, n, 7)   # ISO Sunday
+        rng = (f"{seg.day}–{end.day} {_MONTHS_ABBR[end.month]}" if seg.month == end.month
+               else f"{seg.day} {_MONTHS_ABBR[seg.month]}–{end.day} {_MONTHS_ABBR[end.month]}")
+        weekly.append({"label": f"Semana {n} · {rng}", "short": f"{seg.day}/{seg.month}",
+                       "range": rng, "n": n, "end": end.isoformat(),
+                       "completed": end < date.today(), **v})
 
     mo = bucketize(lambda d: d.month, None, None)
     monthly = []
@@ -145,7 +161,7 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
     return {
         "profile": dict(prof) if prof else {},
         "runs": acts, "load": load, "weekly": weekly, "monthly": monthly,
-        "rhr": rhr, "bb": bb, "sleep": sleep, "races": races,
+        "rhr": rhr, "bb": bb, "sleep": sleep, "races": races, "cross": cross,
         "plan": plan, "pworkouts": pworkouts,
         "alerts": fired, "recovery": recovery,
         "totals": {"km": total_km, "runs": len(acts), "per_week": per_week,
@@ -408,17 +424,45 @@ def page_overview(t: dict[str, Any]) -> str:
 
 
 def page_load(t: dict[str, Any]) -> str:
+    nights = t["sleep"]
+    if nights:
+        sleep_body = (
+            '<div class="sleep-wrap">'
+            f'<div class="fig">{charts.sleep_stages(nights)}</div>'
+            f'<div class="sleep-detail" id="sleep-detail">{_sleep_panel_html(nights[-1])}</div>'
+            '</div>'
+            '<p class="cap">Passe o mouse numa noite para ver o detalhe ao lado. '
+            'Noites sem o relógio não aparecem.</p>')
+    else:
+        sleep_body = charts.sleep_stages(nights)
     return f"""
-    <div class="pagehead"><p class="eyebrow">Carga de treino</p><h1>Condição &amp; carga</h1>
-      <p class="sub">A fitness só subiu quando você emendou semanas — e evaporou no buraco de junho.</p></div>
+    <div class="pagehead"><p class="eyebrow">Fisiologia</p><h1>Carga &amp; recuperação</h1>
+      <p class="sub">Quanto você carregou (condição × fadiga) e como o corpo respondeu
+        (FC de repouso, Body Battery, sono).</p></div>
     <div class="card"><h2>Condição × Fadiga · 4 meses</h2>
       <div class="legend"><span><span class="key" style="background:var(--accent)"></span><b>Condição</b> (fitness, 42d)</span>
         <span><span class="key" style="background:var(--mod)"></span><b>Fadiga</b> (7d)</span></div>
       <div class="fig">{charts.load_lines(t['load'])}</div>
       <p class="cap">Passe o mouse para ver os valores de cada dia.</p></div>
     <div class="card" style="margin-top:16px"><h2>Forma (frescor)</h2>
-      <p class="hint">Acima de zero = descansado; abaixo = fatigado. A sua vive colada no zero.</p>
-      <div class="fig">{charts.form_area(t['load'])}</div></div>"""
+      <p class="hint">Acima de zero = descansado; abaixo = fatigado (Condição − Fadiga).</p>
+      <div class="fig">{charts.form_area(t['load'])}</div></div>
+    <div class="card" style="margin-top:16px"><h2>FC de repouso</h2>
+      <p class="hint">Tendência da FC de repouso — subidas sustentadas sinalizam estresse ou recuperação ruim.</p>
+      <div class="fig">{charts.rhr_line(t['rhr'])}</div></div>
+    <div class="card" style="margin-top:16px"><h2>Body Battery &amp; estresse</h2>
+      <div class="legend"><span><span class="key" style="background:var(--good)"></span><b>bateria</b> (faixa do dia)</span>
+        <span><span class="key" style="background:var(--alert)"></span>dias depletados</span>
+        <span><span class="key" style="background:var(--ink-2)"></span>estresse médio</span></div>
+      <div class="fig">{charts.bb_range(t['bb'])}</div>
+      <p class="cap">Barra = amplitude da bateria no dia. Sono não aparece nos dias sem relógio.</p></div>
+    <div class="card" style="margin-top:16px"><h2>Sono — fases &amp; FC noturna</h2>
+      <div class="legend">
+        <span><span class="key" style="background:var(--seq-4)"></span><b>profundo</b></span>
+        <span><span class="key" style="background:var(--seq-2)"></span><b>leve</b></span>
+        <span><span class="key" style="background:var(--teal)"></span><b>REM</b></span>
+        <span><span class="key" style="background:var(--muted)"></span>acordado</span></div>
+      {sleep_body}</div>"""
 
 
 ZONE_PT = {"easy": "fácil", "mod": "moderado", "hard": "forte", "na": "corrida"}
@@ -440,58 +484,131 @@ def _workouts_kpis(weekly: list[dict[str, Any]]) -> str:
     if last:
         d = last["km"] - avg_km
         delta = f'{d:+.0f} km vs média' if abs(d) >= 0.5 else 'na média'
-        vol = _kpi("Volume · última semana", f'{last["km"]:.0f} km', f'Semana {last["n"]} · {delta}')
+        vol = _kpi("Volume · última semana", f'{last["km"]:.0f} km', f'{last["range"]} · {delta}')
         wk = _kpi("Treinos · última semana", f'{last["runs"]}', f'média {avg_runs:.1f}/semana')
     else:
         vol = _kpi("Volume · última semana", "—", "sem semana concluída")
         wk = _kpi("Treinos · última semana", "—", "—")
     avg = _kpi("Média por semana", f'{avg_km:.0f} km', f'sobre {len(active)} semanas ativas')
-    top = (_kpi("Semana mais forte", f'{best["km"]:.0f} km', f'Semana {best["n"]}')
+    top = (_kpi("Semana mais forte", f'{best["km"]:.0f} km', best["range"])
            if best else _kpi("Semana mais forte", "—", "—"))
     return f'<div class="grid g4">{vol}{wk}{avg}{top}</div>'
 
 
-def _week_strip(runs: list[dict[str, Any]], week: int) -> str:
+_CROSS_PT = {"cycling": "bike", "indoor_cycling": "bike", "lap_swimming": "natação",
+             "open_water_swimming": "natação", "strength_training": "força",
+             "walking": "caminhada", "hiking": "caminhada"}
+
+
+def _week_strip(runs: list[dict[str, Any]], cross: list[dict[str, Any]], week: int) -> str:
     start, end = date.fromisocalendar(2026, week, 1), date.fromisocalendar(2026, week, 7)
-    header = f'Semana {week} · {_dm(start)}–{_dm(end)}'
-    if end >= date.today():
+    today = date.today()
+    tag = " · em andamento" if end >= today else ""
+    header = f'Semana {week} · {_dm(start)}–{_dm(end)}{tag}'
+    if start > today:
         return (f'<div class="card" id="semana" style="margin-top:16px"><h2>{header}</h2>'
-                '<p class="empty">Semana em andamento — o resumo dos 7 dias abre quando ela '
-                'fechar (domingo).</p></div>')
-    by_day: dict[str, list[dict[str, Any]]] = {}
+                '<p class="empty">Esta semana ainda não começou.</p></div>')
+    runs_by, cross_by = {}, {}
     for r in runs:
         if start <= r["d"] <= end:
-            by_day.setdefault(r["d"].isoformat(), []).append(r)
+            runs_by.setdefault(r["d"].isoformat(), []).append(r)
+    for a in cross:
+        if start <= a["d"] <= end:
+            cross_by.setdefault(a["d"].isoformat(), []).append(a)
     cells = []
     for i in range(7):
         dd = date.fromisocalendar(2026, week, i + 1)
-        wd = PT_WD[dd.weekday()]
-        day_runs = by_day.get(dd.isoformat(), [])
+        wd, key = PT_WD[dd.weekday()], dd.isoformat()
+        if dd > today:  # future day of the current week
+            cells.append(
+                f'<div class="pday future"><div class="pd">{wd} {dd.day:02d}</div>'
+                '<div class="pt">—</div><div class="pk">a fazer</div></div>')
+            continue
+        day_runs, day_cross = runs_by.get(key, []), cross_by.get(key, [])
         if day_runs:
             r = max(day_runs, key=lambda x: x["km"])  # the day's main run
-            extra = f' +{len(day_runs)-1}' if len(day_runs) > 1 else ''
+            xtra = " +bike" if day_cross else (f' +{len(day_runs)-1}' if len(day_runs) > 1 else '')
             cells.append(
                 f'<div class="pday run done"><div class="pd">{wd} {dd.day:02d}</div>'
-                f'<div class="pt">{ZONE_PT.get(r["zone"], "corrida")}{extra}</div>'
+                f'<div class="pt">{ZONE_PT.get(r["zone"], "corrida")}{xtra}</div>'
                 f'<div class="pk">{r["km"]:.0f} km · {r["pace"] or "—"}</div></div>')
+        elif day_cross:  # no run, but cross-trained — a labeled day off
+            a = max(day_cross, key=lambda x: (x["km"], x["min"]))
+            metric = f'{a["km"]:.0f} km' if a["km"] else f'{a["min"]} min'
+            cells.append(
+                f'<div class="pday cross"><div class="pd">{wd} {dd.day:02d}</div>'
+                f'<div class="pt">{_CROSS_PT.get(a["type"], a["type"])}</div>'
+                f'<div class="pk">{metric}</div></div>')
         else:
             cells.append(
                 f'<div class="pday rest"><div class="pd">{wd} {dd.day:02d}</div>'
                 '<div class="pt">descanso</div><div class="pk">&mdash;</div></div>')
     return (f'<div class="card" id="semana" style="margin-top:16px"><h2>{header}</h2>'
-            '<p class="hint">O que você fez em cada dia — clique noutra semana no gráfico acima.</p>'
+            '<p class="hint">Corrida (roxo) · cross/força (teal, folga da corrida) · descanso. '
+            'Clique noutra semana no gráfico acima.</p>'
             f'<div class="plan" style="margin-top:10px">{"".join(cells)}</div></div>')
 
 
-def page_workouts(t: dict[str, Any], week: str | None = None) -> str:
-    completed_ns = [w["n"] for w in t["weekly"] if w["completed"]]
-    sel = int(week) if (week or "").isdigit() and int(week) in completed_ns else None
-    if sel is None:
-        with_runs = [w["n"] for w in t["weekly"] if w["completed"] and w["runs"] > 0]
-        sel = max(with_runs, default=(max(completed_ns, default=None)))
+_MONTH_FULL = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+               "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+
+
+def _month_weeks(runs: list[dict[str, Any]], y: int, m: int) -> list[dict[str, Any]]:
+    """Weekly aggregates for the ISO weeks that overlap the month (y, m)."""
+    first = date(y, m, 1)
+    last = (date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)) - timedelta(days=1)
+    d = date.fromisocalendar(*first.isocalendar()[:2], 1)          # Monday of the first ISO week
+    end_monday = date.fromisocalendar(*last.isocalendar()[:2], 1)  # Monday of the last ISO week
+    weeks = []
+    while d <= end_monday:
+        seg, end = d, d + timedelta(days=6)
+        wr = [r for r in runs if seg <= r["d"] <= end]
+        rng = (f"{seg.day}–{end.day} {_MONTHS_ABBR[end.month]}" if seg.month == end.month
+               else f"{seg.day} {_MONTHS_ABBR[seg.month]}–{end.day} {_MONTHS_ABBR[end.month]}")
+        short = (f"{seg.day}–{end.day}/{seg.month}" if seg.month == end.month
+                 else f"{seg.day}/{seg.month}–{end.day}/{end.month}")
+        weeks.append({
+            "n": seg.isocalendar()[1], "short": short, "range": rng,
+            "label": f"Semana {seg.isocalendar()[1]} · {rng}", "end": end.isoformat(),
+            "completed": end < date.today(), "started": seg <= date.today(),
+            "km": sum(r["km"] for r in wr), "runs": len(wr),
+            "easy": sum(r["km"] for r in wr if r["zone"] == "easy"),
+            "mod": sum(r["km"] for r in wr if r["zone"] == "mod"),
+            "hard": sum(r["km"] for r in wr if r["zone"] == "hard")})
+        d += timedelta(days=7)
+    return weeks
+
+
+def page_workouts(t: dict[str, Any], week: str | None = None, month: str | None = None) -> str:
+    runs, today = t["runs"], date.today()
+    if month and re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+        y, mo = int(month[:4]), int(month[5:7])
+    elif week and week.isdigit():
+        wd = date.fromisocalendar(today.isocalendar()[0], int(week), 1)
+        y, mo = wd.year, wd.month
+    else:
+        latest = runs[-1]["d"] if runs else today
+        y, mo = latest.year, latest.month
+    msel = f"{y:04d}-{mo:02d}"
+    mweeks = _month_weeks(runs, y, mo)
+
+    in_month = {w["n"] for w in mweeks}
+    sel = int(week) if (week or "").isdigit() and int(week) in in_month else None
+    if sel is None:  # default to the most recent started week that has runs (incl. the current one)
+        sel = max([w["n"] for w in mweeks if w["started"] and w["runs"] > 0], default=None)
+
+    prev_m = (date(y, mo, 1) - timedelta(days=1)).strftime("%Y-%m")
+    next_dt = date(y + 1, 1, 1) if mo == 12 else date(y, mo + 1, 1)
+    nxt = (f'<a class="mnav" href="/treinos?m={next_dt.strftime("%Y-%m")}">›</a>'
+           if next_dt <= date(today.year, today.month, 1) else '<span class="mnav off">›</span>')
+    month_nav = (f'<div class="mnav-bar"><a class="mnav" href="/treinos?m={prev_m}">‹</a>'
+                 f'<span class="mnav-lbl">{_MONTH_FULL[mo]} {y}</span>{nxt}</div>')
+    m_runs = [r for r in runs if r["d"].year == y and r["d"].month == mo]
+    m_total = (f'{sum(r["km"] for r in m_runs):.2f} km · {len(m_runs)} treinos '
+               f'em {_MONTH_FULL[mo].lower()}')
 
     rows = []
-    for r in reversed(t["runs"]):
+    for r in reversed(runs):
         ate = f'{r["aerobic_training_effect"]:.1f}' if r["aerobic_training_effect"] else "—"
         ana = f'{r["anaerobic_training_effect"]:.1f}' if r.get("anaerobic_training_effect") else "—"
         rows.append(
@@ -507,21 +624,22 @@ def page_workouts(t: dict[str, Any], week: str | None = None) -> str:
              '<th class="num" data-tip="Training Effect anaeróbico do Garmin (0–5): carga de '
              'alta intensidade / potência da corrida">TE anaer.</th>'
              f'<th>Zona</th></tr></thead><tbody>{"".join(rows)}</tbody></table>')
-    zoom = _week_strip(t["runs"], sel) if sel else ""
+    zoom = (_week_strip(runs, t["cross"], sel) if sel else
+            '<div class="card" id="semana" style="margin-top:16px">'
+            '<p class="empty">Nenhuma corrida neste mês.</p></div>')
     return f"""
     <div class="pagehead"><p class="eyebrow">Treinos</p><h1>Volume &amp; intensidade</h1>
-      <p class="sub">Volume por semana em primeiro plano — clique numa semana concluída para ver os 7 dias.</p></div>
+      <p class="sub">Volume por semana — navegue os meses e clique numa semana para ver os 7 dias.</p></div>
     {_workouts_kpis(t['weekly'])}
-    <div class="card" style="margin-top:16px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-      <h2 style="margin:0">Volume por semana</h2>
-      <div class="seg"><button class="on" data-toggle="vol" data-view="week">Semana</button>
-        <button data-toggle="vol" data-view="month">Mês</button></div></div>
+    <div class="card" id="vol" style="margin-top:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <div><h2 style="margin:0">Volume por semana</h2>
+          <p class="hint" style="margin-top:2px">{m_total}</p></div>{month_nav}</div>
       {INTENSITY_LEGEND}
-      <div class="fig" data-group="vol" data-view="week">{charts.volume_bars(t['weekly'], 'semana', pips=True, week_link=True, selected=sel)}</div>
-      <div class="fig" data-group="vol" data-view="month" style="display:none">{charts.volume_bars(t['monthly'], 'mês')}</div>
-      <p class="cap">Pontos embaixo = treinos na semana · linha tracejada = média · clique numa semana para ampliar.</p></div>
+      <div class="fig">{charts.volume_bars(mweeks, 'semana', pips=True, week_link=True, selected=sel, month=msel)}</div>
+      <p class="cap">Pontos embaixo = treinos na semana · clique numa semana para ampliar.</p></div>
     {zoom}
-    <details class="allruns" style="margin-top:16px"><summary>Ver todas as corridas ({len(t['runs'])})</summary>
+    <details class="allruns" style="margin-top:16px"><summary>Ver todas as corridas ({len(runs)})</summary>
       <div class="fig" style="overflow-x:auto;margin-top:12px">{table}</div>
       <p class="cap">TE = Training Effect do Garmin (0–5): impacto aeróbico (resistência) e anaeróbico (alta intensidade).</p></details>"""
 
@@ -540,59 +658,29 @@ def _sleep_panel_html(n: dict[str, Any]) -> str:
             f'<span class="sd-min">(mín {n["hr_min"] or "—"})</span></div>')
 
 
-def page_recovery(t: dict[str, Any]) -> str:
-    nights = t["sleep"]
-    if nights:
-        sleep_body = (
-            '<div class="sleep-wrap">'
-            f'<div class="fig">{charts.sleep_stages(nights)}</div>'
-            f'<div class="sleep-detail" id="sleep-detail">{_sleep_panel_html(nights[-1])}</div>'
-            '</div>'
-            '<p class="cap">Passe o mouse numa noite para ver o detalhe ao lado. '
-            'Noites sem o relógio não aparecem.</p>')
-    else:
-        sleep_body = charts.sleep_stages(nights)
-    return f"""
-    <div class="pagehead"><p class="eyebrow">Recuperação</p><h1>Como o corpo respondeu</h1>
-      <p class="sub">Um alerta real no fim de junho — e uma boa recuperação logo depois.</p></div>
-    <div class="card"><h2>FC de repouso</h2>
-      <p class="hint">Subiu de 40 para 49 bpm entre 28/jun e 05/jul — sinal de estresse/recuperação ruim.</p>
-      <div class="fig">{charts.rhr_line(t['rhr'])}</div></div>
-    <div class="card" style="margin-top:16px"><h2>Body Battery &amp; estresse</h2>
-      <div class="legend"><span><span class="key" style="background:var(--good)"></span><b>bateria</b> (faixa do dia)</span>
-        <span><span class="key" style="background:var(--alert)"></span>dias depletados</span>
-        <span><span class="key" style="background:var(--ink-2)"></span>estresse médio</span></div>
-      <div class="fig">{charts.bb_range(t['bb'])}</div>
-      <p class="cap">Barra = amplitude da bateria no dia. Sono não aparece nos dias sem relógio.</p></div>
-    <div class="card" style="margin-top:16px"><h2>Sono — fases &amp; FC noturna</h2>
-      <div class="legend">
-        <span><span class="key" style="background:var(--seq-4)"></span><b>profundo</b></span>
-        <span><span class="key" style="background:var(--seq-2)"></span><b>leve</b></span>
-        <span><span class="key" style="background:var(--teal)"></span><b>REM</b></span>
-        <span><span class="key" style="background:var(--muted)"></span>acordado</span></div>
-      {sleep_body}</div>"""
-
-
 def page_reports(t: dict[str, Any]) -> str:
-    REPORTS_DIR.mkdir(exist_ok=True)
-    files = sorted(REPORTS_DIR.glob("*.json"), reverse=True)
-    items = []
-    for f in files:
-        try:
-            meta = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        items.append(f'<div class="ritem"><div><b>{_esc(meta.get("title", f.stem))}</b>'
-                     f'<br><span class="hint">{_esc(meta.get("generated_at", "")[:16])}</span></div>'
-                     f'<span class="pill">{_esc(meta.get("km", "—"))} km · CTL {_esc(meta.get("ctl", "—"))}</span></div>')
-    archive = "".join(items) or '<p class="empty">Nenhum relatório salvo ainda. Gere o primeiro abaixo — os próximos se acumulam a cada semana.</p>'
+    plan = t["plan"]
+    plan_line = (f'Plano ativo: semana de {_esc(plan["week_start_date"])}.' if plan
+                 else 'Nenhum plano ativo — importe um abaixo.')
+    btn = ('display:inline-block;margin-top:12px;text-decoration:none;border:0')
     return f"""
-    <div class="pagehead"><p class="eyebrow">Relatórios</p><h1>Arquivo</h1>
-      <p class="sub">Cada semana vira um instantâneo salvo, navegável no tempo.</p></div>
-    <div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-      <h2 style="margin:0">Relatórios salvos</h2>
-      <form method="post" action="/relatorios/gerar"><button class="pill" style="border:0;cursor:pointer;background:var(--accent);color:#fff">+ Gerar instantâneo</button></form>
-    </div><div class="rlist" style="margin-top:12px">{archive}</div></div>"""
+    <div class="pagehead"><p class="eyebrow">Coach</p><h1>Relatórios</h1>
+      <p class="sub">O ponto de troca com o seu coach: gere o snapshot para levar ao chat e
+        importe o plano de volta. {plan_line}</p></div>
+    <div class="grid g2">
+      <div class="card"><h2>1 · Exportar snapshot</h2>
+        <p class="hint">Estado atual + histórico recente (carga, bem-estar, corridas, cadência,
+          decoupling, zonas) para colar no chat do coach.</p>
+        <a class="pill solid" style="{btn}" href="/exportar">Gerar snapshot →</a></div>
+      <div class="card"><h2>2 · Importar plano</h2>
+        <p class="hint">Cole o plano (JSON) que o coach devolveu; o verificador aprova ou
+          bloqueia antes de gravar, e você aprova.</p>
+        <a class="pill solid" style="{btn}" href="/importar">Importar plano →</a></div>
+    </div>
+    <div class="card" style="margin-top:16px"><h2>Como funciona</h2>
+      <p class="hint">Sincronize os dados → <b>gere o snapshot</b> → cole no Project do Claude
+        (seu coach) → ele devolve o plano em JSON → <b>importe e aprove</b> aqui. A partir daí o
+        painel rastreia planejado vs. real, e a "Esta semana" (Visão geral) mostra o plano.</p></div>"""
 
 
 # ------------------------------------------------------------- sync page ------
@@ -823,18 +911,6 @@ def page_sync(d: dict[str, Any]) -> str:
       <div class="card"><h2>Histórico</h2>
         <p class="hint">Últimas sincronizações e seu resultado.</p>
         <div class="fig" style="overflow-x:auto">{_sync_history(d['history'])}</div></div>
-    </div>
-    <div class="grid g2" style="margin-top:16px">
-      <div class="card"><h2>Exportar para o coach</h2>
-        <p class="hint">Gera o snapshot (estado + histórico + zonas, cadência, decoupling)
-          para colar no chat do coach.</p>
-        <a class="pill solid" style="display:inline-block;margin-top:10px;text-decoration:none;
-          border:0" href="/exportar">Gerar snapshot →</a></div>
-      <div class="card"><h2>Importar plano do coach</h2>
-        <p class="hint">Cola o plano (JSON) que o coach devolveu; o verificador aprova ou
-          bloqueia antes de gravar.</p>
-        <a class="pill ghost" style="display:inline-block;margin-top:10px;text-decoration:none"
-          href="/importar">Importar plano →</a></div>
     </div>"""
 
 
@@ -853,9 +929,8 @@ LOGO = ('<svg viewBox="0 0 100 100" width="22" height="22" fill="#fff" aria-hidd
         '<polygon points="49.5,57.0 45.3,67.1 47.7,82.9 52.3,67.6"/>'
         '<polygon points="53.9,55.8 57.8,68.7 71.8,82.3 64.4,64.2"/>'
         '<polygon points="56.3,53.1 63.2,60.0 77.0,63.2 66.0,54.2"/></svg>')
-NAV = [("/", "Visão geral"), ("/carga", "Condição & carga"), ("/treinos", "Treinos"),
-       ("/recuperacao", "Recuperação"), ("/relatorios", "Relatórios"),
-       ("/sincronizacao", "Sincronização")]
+NAV = [("/", "Visão geral"), ("/carga", "Carga & recuperação"), ("/treinos", "Treinos"),
+       ("/relatorios", "Relatórios"), ("/sincronizacao", "Sincronização")]
 
 
 def shell(active: str, title: str, body: str) -> str:
@@ -919,24 +994,24 @@ def home(request: Request) -> str:
 
 @app.get("/carga", response_class=HTMLResponse)
 def carga() -> str:
-    return _render("/carga", "Condição & carga", page_load)
+    return _render("/carga", "Carga & recuperação", page_load)
 
 
 @app.get("/treinos", response_class=HTMLResponse)
 def treinos(request: Request) -> str:
-    week = request.query_params.get("w")
     conn = get_connection()
     try:
         run_migrations(conn)
         t = load_data(conn)
     finally:
         conn.close()
-    return shell("/treinos", "Treinos", page_workouts(t, week))
+    return shell("/treinos", "Treinos",
+                 page_workouts(t, request.query_params.get("w"), request.query_params.get("m")))
 
 
-@app.get("/recuperacao", response_class=HTMLResponse)
-def recuperacao() -> str:
-    return _render("/recuperacao", "Recuperação", page_recovery)
+@app.get("/recuperacao")
+def recuperacao() -> RedirectResponse:
+    return RedirectResponse(url="/carga", status_code=307)  # merged into Carga & recuperação
 
 
 @app.get("/relatorios", response_class=HTMLResponse)
@@ -973,8 +1048,8 @@ def exportar() -> str:
         'font-family:ui-monospace,monospace;font-size:12.5px;background:var(--inset);'
         'color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:12px;'
         f'resize:vertical">{_esc(text)}</textarea>'
-        '<p class="cap"><a href="/sincronizacao" style="color:var(--accent)">← voltar</a></p></div>')
-    return shell("/sincronizacao", "Export", body)
+        '<p class="cap"><a href="/relatorios" style="color:var(--accent)">← voltar</a></p></div>')
+    return shell("/relatorios", "Export", body)
 
 
 # ------------------------------------------------------------ plan import -----
@@ -1037,7 +1112,7 @@ def _page_import(form_html: str, result_html: str, banner: str = "") -> str:
 def importar_get(request: Request) -> str:
     banner = (_banner("ok", "Plano aprovado", "Está ativo — o painel vai rastrear planejado vs. real.")
               if request.query_params.get("ok") == "1" else "")
-    return shell("/sincronizacao", "Importar", _page_import(_import_form(), "", banner))
+    return shell("/relatorios", "Importar", _page_import(_import_form(), "", banner))
 
 
 @app.post("/importar", response_class=HTMLResponse)
@@ -1057,7 +1132,7 @@ def importar_post(plan: str = Form("")) -> str:
             pasted = plan
     finally:
         conn.close()
-    return shell("/sincronizacao", "Importar", _page_import(_import_form(pasted), res_html))
+    return shell("/relatorios", "Importar", _page_import(_import_form(pasted), res_html))
 
 
 @app.post("/importar/aprovar")
@@ -1074,21 +1149,6 @@ def importar_aprovar(request: Request) -> RedirectResponse:
     return RedirectResponse(url="/importar?ok=1", status_code=303)
 
 
-@app.post("/relatorios/gerar")
-def gerar_relatorio() -> RedirectResponse:
-    conn = get_connection()
-    try:
-        run_migrations(conn)
-        t = load_data(conn)["totals"]
-    finally:
-        conn.close()
-    REPORTS_DIR.mkdir(exist_ok=True)
-    today = date.today().isoformat()
-    snap = {"title": f"Relatório · semana de {today}", "generated_at": datetime.now().isoformat(),
-            "km": t["km"], "ctl": round(t["ctl"], 1), "runs": t["runs"]}
-    (REPORTS_DIR / f"{today}.json").write_text(json.dumps(snap, ensure_ascii=False, indent=2),
-                                               encoding="utf-8")
-    return RedirectResponse(url="/relatorios", status_code=303)
 
 
 @app.post("/sync")

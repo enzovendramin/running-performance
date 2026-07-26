@@ -139,7 +139,8 @@ def form_area(load: list[dict]) -> str:
 
 # ---------------------------------------- weekly/monthly volume w/ intensity --
 def volume_bars(items: list[dict], span_label: str, *, pips: bool = False,
-                week_link: bool = False, selected: int | None = None) -> str:
+                week_link: bool = False, selected: int | None = None,
+                month: str | None = None) -> str:
     """Stacked bars (easy/mod/hard km) per period, with hover breakdown. Optional:
     pips (one dot per workout), a period-average line, and per-week click-through to
     the week zoom (completed weeks only)."""
@@ -154,12 +155,6 @@ def volume_bars(items: list[dict], span_label: str, *, pips: bool = False,
         y = _sy(gv, 0, vmax, y0, y1)
         p.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" class="grid-l"/>')
         p.append(f'<text x="{ml-6}" y="{y+3:.1f}" class="tk tk-r">{gv}</text>')
-    active = [it["km"] for it in items if it["km"] > 0]
-    if active:
-        avg = sum(active) / len(active)
-        ya = _sy(avg, 0, vmax, y0, y1)
-        p.append(f'<line x1="{ml}" y1="{ya:.1f}" x2="{x1}" y2="{ya:.1f}" class="dash"/>')
-        p.append(f'<text x="{x1}" y="{ya-4:.1f}" class="note tk-r">média {avg:.0f} km</text>')
     for i, it in enumerate(items):
         cx = x0 + bw * i + bw / 2
         bwid = min(34, bw * 0.62)
@@ -184,14 +179,16 @@ def volume_bars(items: list[dict], span_label: str, *, pips: bool = False,
                          f'height="{h:.1f}" class="{cls} hoverable" data-tip="{tip}"/>')
                 base -= h
             g.append('</g>')
-            g.append(f'<text x="{cx:.1f}" y="{stop-5:.1f}" class="note tk-m">{it["km"]:.0f}</text>')
+            g.append(f'<text x="{cx:.1f}" y="{stop-5:.1f}" class="note tk-m">{it["km"]:.2f}</text>')
             group = "".join(g)
-            if week_link and it.get("completed"):
-                p.append(f'<a href="/treinos?w={it["n"]}#semana" class="vol-a">{group}</a>')
+            if week_link and it.get("started"):
+                q = f'm={month}&amp;w={it["n"]}' if month else f'w={it["n"]}'
+                p.append(f'<a href="/treinos?{q}#semana" class="vol-a">{group}</a>')
             else:
                 p.append(group)
         if week_link and selected is not None and it.get("n") == selected:
-            p.append(f'<rect x="{cx-14:.1f}" y="{H-37:.0f}" width="28" height="16" rx="8" '
+            cw = len(it["short"]) * 6.5 + 12
+            p.append(f'<rect x="{cx-cw/2:.1f}" y="{H-37:.0f}" width="{cw:.1f}" height="16" rx="8" '
                      f'class="tk-chip"/>')
             p.append(f'<text x="{cx:.1f}" y="{H-26:.0f}" class="tk tk-m tk-sel">{it["short"]}</text>')
         else:

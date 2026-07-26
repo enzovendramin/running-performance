@@ -113,6 +113,15 @@ h2{font-size:19px;letter-spacing:-.01em;margin:0 0 3px;font-weight:680}
 .hoverable{cursor:pointer;transition:opacity .1s}
 .hoverable:hover{opacity:.78}
 
+/* ---- month nav (weekly volume) ---- */
+.mnav-bar{display:inline-flex;align-items:center;gap:10px}
+.mnav{display:inline-flex;width:28px;height:28px;align-items:center;justify-content:center;
+  border-radius:8px;background:var(--surface-2);color:var(--ink-2);text-decoration:none;
+  font-size:16px;font-weight:700;line-height:1}
+.mnav:hover{background:var(--accent-weak);color:var(--accent-strong)}
+.mnav.off{opacity:.35;pointer-events:none}
+.mnav-lbl{font-weight:640;font-size:14.5px;min-width:118px;text-align:center}
+
 /* ---- toggle ---- */
 .seg{display:inline-flex;background:var(--surface-2);border:1px solid var(--line);
   border-radius:10px;padding:3px;gap:2px}
@@ -143,6 +152,10 @@ h2{font-size:19px;letter-spacing:-.01em;margin:0 0 3px;font-weight:680}
 .pday.rest .pt{color:var(--muted);font-weight:500}
 .pday.run{border-color:var(--accent-soft);background:var(--accent-weak)}
 .pday.done{border-color:var(--good)}
+.pday.cross{border-color:var(--teal);background:var(--good-weak)}
+.pday.cross .pt{color:var(--teal);font-weight:650}
+.pday.future{border-style:dashed;background:transparent}
+.pday.future .pt,.pday.future .pk{color:var(--muted)}
 
 /* ---- sync feedback banner ---- */
 .banner{display:flex;align-items:flex-start;gap:12px;padding:13px 16px;border-radius:14px;
