@@ -30,8 +30,10 @@ from coach.web.assets import CSS, JS
 app = FastAPI(title="Coach")
 
 # ---------------------------------------------------------------- helpers -----
-PT_MONTH = {3: "Março", 4: "Abril", 5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto"}
-PT_MONTH_SHORT = {3: "mar", 4: "abr", 5: "mai", 6: "jun", 7: "jul", 8: "ago"}
+PT_MONTH = {1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
+            7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"}
+PT_MONTH_SHORT = {1: "jan", 2: "fev", 3: "mar", 4: "abr", 5: "mai", 6: "jun",
+                  7: "jul", 8: "ago", 9: "set", 10: "out", 11: "nov", 12: "dez"}
 PT_WD = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
 REPORTS_DIR = Path(__file__).resolve().parent.parent.parent / "reports"
 
