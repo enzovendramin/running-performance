@@ -14,8 +14,21 @@ signals — all local and private.
 
 ## Dashboard
 
-Five screens (Portuguese UI, white + purple, interactive, fully offline):
-**Visão geral** · **Condição & carga** · **Treinos** · **Recuperação** · **Relatórios**.
+Five screens, server-rendered and fully offline: **Overview** · **Load & recovery** ·
+**Workouts** · **Reports** · **Sync**. The UI is in Portuguese by design (single athlete,
+native language); the screenshots below are captured with English labels.
+
+![Overview — fitness, form, weekly runs and VO2max gauges, plus the active week plan](docs/dashboard-overview.png)
+
+*Overview: current fitness (CTL), form (TSB), runs per week and VO₂max, each with a scale
+and a status tag, followed by the active training week.*
+
+![Load & recovery — fitness × fatigue, form, resting HR, Body Battery and sleep](docs/dashboard-load-recovery.png)
+
+*Load & recovery: four months of fitness (42-day) vs fatigue (7-day) load, the resulting
+form curve, resting-HR trend with outlier days flagged, daily Body Battery range, and sleep
+stages with overnight HR. The August fatigue spike, the fitness peak that follows it, and
+the return to positive form as load drops are all visible in one screen.*
 
 ## Setup
 
