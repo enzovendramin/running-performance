@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from coach import alerts as alertmod
 from coach import rules
-from coach.db import get_connection, run_migrations
+from coach.db import get_connection, run_migrations, utcnow
 from coach.web import charts
 from coach.web.assets import CSS, JS
 
@@ -43,6 +43,15 @@ app = FastAPI(title="Coach", lifespan=lifespan)
 
 # ---------------------------------------------------------------- helpers -----
 PT_WD = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+STALE_AFTER_HOURS = 72  # no successful sync for this long = data shown as out of date
+
+# inbox rows written before the alert texts were translated to Portuguese
+LEGACY_TITLE_PT = {
+    "Acute load well above your base": "Carga aguda bem acima da sua base",
+    "Big jump in weekly load": "Salto grande na carga semanal",
+    "Accumulated fatigue": "Fadiga acumulada",
+    "Can't reach Garmin": "Sem conexão com o Garmin",
+}
 
 
 def _esc(v: Any) -> str:
@@ -153,6 +162,37 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
                         "km": sum(w["target_distance_m"] or 0 for w in runs) / 1000,
                         "replaces": replaces is not None})
 
+    # alert history (the inbox): listed in Carga & recuperação and drawn as markers on
+    # the load chart, so you see what fired, when, on top of the load that caused it
+    inbox = [dict(r) for r in conn.execute(
+        "SELECT id, type, title, body, status, created_at FROM inbox_message"
+        " WHERE type IN ('risk_alert', 'sync_warning') ORDER BY created_at DESC LIMIT 30")]
+    for m in inbox:
+        m["title"] = LEGACY_TITLE_PT.get(m["title"], m["title"])
+        m["date"] = _local_day(m["created_at"])
+    events = [m for m in inbox if m["type"] == "risk_alert" and m["date"]]
+
+    # planned vs. actual for the last 8 approved weeks (statuses from coach.matching)
+    plan_weeks: list[dict[str, Any]] = []
+    for p in conn.execute("SELECT id, week_start_date FROM weekly_plan"
+                          " WHERE status IN ('active', 'completed')"
+                          " ORDER BY week_start_date DESC LIMIT 8"):
+        prun = [w for w in conn.execute(
+            "SELECT pw.type, pw.target_distance_m, pw.status,"
+            " (SELECT a.distance_m FROM activity a WHERE a.planned_workout_id = pw.id) AS done_m"
+            " FROM planned_workout pw WHERE pw.weekly_plan_id = ?", (p["id"],))
+            if rules.is_running(w["type"])]
+        ws = date.fromisoformat(p["week_start_date"])
+        plan_weeks.insert(0, {
+            "label": _dm(ws), "short": f"{ws.day}/{ws.month}",
+            "planned_km": sum(w["target_distance_m"] or 0 for w in prun) / 1000,
+            "done_km": sum(w["done_m"] or 0 for w in prun) / 1000,
+            "due_runs": sum(1 for w in prun if w["status"] != "planned"),  # day already passed
+            "done_runs": sum(1 for w in prun if w["status"] in ("completed", "modified"))})
+
+    last_ok = conn.execute(
+        "SELECT ran_at FROM sync_log WHERE status='ok' ORDER BY id DESC LIMIT 1").fetchone()
+
     fired = alertmod.evaluate(conn, date.today())
     recovery = alertmod.recovery_flags(conn)
 
@@ -165,7 +205,8 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
         "runs": acts, "load": load, "weekly": weekly,
         "rhr": rhr, "bb": bb, "sleep": sleep, "races": races, "cross": cross,
         "plan": plan, "pworkouts": pworkouts, "pending": pending,
-        "alerts": fired, "recovery": recovery,
+        "alerts": fired, "recovery": recovery, "inbox": inbox, "events": events,
+        "plan_weeks": plan_weeks, "last_sync_ok": last_ok["ran_at"] if last_ok else None,
         "totals": {"km": total_km, "runs": len(acts), "per_week": per_week,
                    "ctl": load[-1]["ctl"] if load else 0, "atl": load[-1]["atl"] if load else 0,
                    "tsb": load[-1]["tsb"] if load else 0,
@@ -323,26 +364,63 @@ def _whatsapp_plan_text(plan: dict[str, Any], pworkouts: list[dict[str, Any]]) -
     return "\n".join(lines)
 
 
-RECOVERY_PT = {
-    "resting HR elevated": "FC de repouso elevada",
-    "Body Battery low": "Body Battery baixa",
-    "short sleep": "sono curto",
-}
-
-
 def _alerts_block(t: dict[str, Any]) -> str:
     rows = []
     for a in t["alerts"]:
         rows.append(f'<div class="alertrow"><span class="dot" style="background:var(--alert)"></span>'
                     f'<div><b>{_esc(a["title"])}</b><br>{_esc(a["message"])}</div></div>')
     if t["recovery"]:
-        flags = ", ".join(RECOVERY_PT.get(f, f) for f in t["recovery"])
+        flags = ", ".join(alertmod.RECOVERY_LABEL_PT.get(f, f) for f in t["recovery"])
         rows.append(f'<div class="alertrow"><span class="dot" style="background:var(--warn)"></span>'
                     f'<div>Sinais de recuperação: {_esc(flags)}</div></div>')
     if not rows:
         return ('<div class="alertrow"><span class="dot" style="background:var(--good)"></span>'
                 '<div>Tudo tranquilo — nenhum sinal de sobrecarga.</div></div>')
     return '<div class="rlist">' + "".join(rows) + "</div>"
+
+
+def _stale_banner(last_ok: str | None) -> str:
+    """Warn at the top of the overview when the data is out of date (a "no data" check)."""
+    h = _hours_since(last_ok)
+    if h is not None and h < STALE_AFTER_HOURS:
+        return ""
+    title, msg = (("Dados desatualizados",
+                   f"Último sync com sucesso {_ago(last_ok)} — os números abaixo param aí.")
+                  if last_ok else
+                  ("Ainda sem dados do Garmin", "Sincronize para preencher o painel."))
+    return ('<div class="banner b-warn" role="status"><span class="bico"></span>'
+            f'<div class="btext"><b>{_esc(title)}</b><span>{_esc(msg)}</span></div>'
+            '<form method="post" action="/sync?next=/" data-sync'
+            ' style="margin-left:auto;align-self:center">'
+            '<button class="pill solid" style="border:0;cursor:pointer"'
+            ' data-progress="↻ Sincronizando…">↻ Sincronizar agora</button></form></div>')
+
+
+def _alert_history(inbox: list[dict[str, Any]]) -> str:
+    """Card listing everything the system warned about, with mark-as-read."""
+    rows = []
+    for m in inbox:
+        unread = m["status"] == "unread"
+        dot = "var(--alert)" if m["type"] == "risk_alert" else "var(--warn)"
+        new = ' <span class="gtag t-alert">novo</span>' if unread else ""
+        action = (f'<form method="post" action="/alertas/lido?id={m["id"]}" style="margin-left:auto">'
+                  '<button class="pill ghost" style="cursor:pointer">Marcar como lido</button></form>'
+                  if unread else '<span class="hint" style="margin-left:auto">lido</span>')
+        rows.append(f'<div class="alertrow"><span class="dot" style="background:{dot}"></span>'
+                    f'<div><b>{_esc(m["title"])}</b>{new}<br>'
+                    f'<span class="hint">{_esc(_fmt_dt(m["created_at"]))}</span> · '
+                    f'{_esc(m["body"])}</div>{action}</div>')
+    body = ('<div class="rlist" style="margin-top:10px">' + "".join(rows) + "</div>" if rows
+            else '<p class="empty">Nenhum alerta registrado até agora.</p>')
+    all_btn = ('<form method="post" action="/alertas/lido?id=todos"><button class="pill ghost"'
+               ' style="cursor:pointer">Marcar todos como lidos</button></form>'
+               if any(m["status"] == "unread" for m in inbox) else "")
+    return ('<div class="card" id="alertas" style="margin-top:16px">'
+            '<div style="display:flex;justify-content:space-between;align-items:center;'
+            'gap:8px;flex-wrap:wrap"><div><h2 style="margin:0">Histórico de alertas</h2>'
+            '<p class="hint" style="margin-top:2px">Tudo o que o sistema avisou — os de carga'
+            ' também aparecem como ▲ no gráfico acima.</p></div>'
+            f'{all_btn}</div>{body}</div>')
 
 
 INTENSITY_LEGEND = (
@@ -414,6 +492,7 @@ def page_overview(t: dict[str, Any]) -> str:
             "navigator.clipboard.writeText(document.getElementById('waText').value);"
             "this.textContent='Copiado!'\">Copiar mensagem</button></div>")
     return f"""
+    {_stale_banner(t['last_sync_ok'])}
     <div class="pagehead"><p class="eyebrow">Painel</p><h1>Visão geral</h1>
       <p class="sub">Motor de elite, base a reconstruir. O essencial num relance — passe o mouse nos gráficos.</p></div>
     <div class="grid g4">
@@ -432,8 +511,8 @@ def page_overview(t: dict[str, Any]) -> str:
     <div class="grid g2" style="margin-top:16px">
       <div class="card"><h2>Alertas &amp; recuperação</h2>{_alerts_block(t)}</div>
       <div class="card"><h2>Condição &amp; fadiga</h2>
-        <p class="hint">Fitness (roxo) vs fadiga (âmbar) — <a href="/carga" style="color:var(--accent)">ver detalhe</a>.</p>
-        <div class="fig">{charts.load_lines(t['load'])}</div></div>
+        <p class="hint">Fitness (roxo) vs fadiga (âmbar) · ▲ = alerta — <a href="/carga" style="color:var(--accent)">ver detalhe</a>.</p>
+        <div class="fig">{charts.load_lines(t['load'], t['events'])}</div></div>
     </div>"""
 
 
@@ -455,9 +534,11 @@ def page_load(t: dict[str, Any]) -> str:
         (FC de repouso, Body Battery, sono).</p></div>
     <div class="card"><h2>Condição × Fadiga · 4 meses</h2>
       <div class="legend"><span><span class="key" style="background:var(--accent)"></span><b>Condição</b> (fitness, 42d)</span>
-        <span><span class="key" style="background:var(--mod)"></span><b>Fadiga</b> (7d)</span></div>
-      <div class="fig">{charts.load_lines(t['load'])}</div>
-      <p class="cap">Passe o mouse para ver os valores de cada dia.</p></div>
+        <span><span class="key" style="background:var(--mod)"></span><b>Fadiga</b> (7d)</span>
+        <span><span style="color:var(--alert)">▲</span> alerta disparado</span></div>
+      <div class="fig">{charts.load_lines(t['load'], t['events'])}</div>
+      <p class="cap">Passe o mouse para ver os valores de cada dia e o que cada alerta disse.</p></div>
+    {_alert_history(t['inbox'])}
     <div class="card" style="margin-top:16px"><h2>Forma (frescor)</h2>
       <p class="hint">Acima de zero = descansado; abaixo = fatigado (Condição − Fadiga).</p>
       <div class="fig">{charts.form_area(t['load'])}</div></div>
@@ -647,6 +728,18 @@ def page_workouts(t: dict[str, Any], week: str | None = None, month: str | None 
              '<th class="num" data-tip="Training Effect anaeróbico do Garmin (0–5): carga de '
              'alta intensidade / potência da corrida">TE anaer.</th>'
              f'<th>Zona</th></tr></thead><tbody>{"".join(rows)}</tbody></table>')
+    pw = t["plan_weeks"]
+    due, done = sum(w["due_runs"] for w in pw), sum(w["done_runs"] for w in pw)
+    pva_hint = (f'{done} de {due} corridas planejadas cumpridas ({done / due * 100:.0f}%) '
+                f'nas últimas {len(pw)} semanas com plano aprovado.' if due else
+                'Ainda não há corridas planejadas com a data vencida.')
+    pva = ('<div class="card" id="plano" style="margin-top:16px"><h2>Planejado vs. realizado</h2>'
+           f'<p class="hint">{pva_hint}</p>'
+           '<div class="legend" style="margin-top:8px"><span><span class="key" style="'
+           'background:var(--accent-weak);border:1px solid var(--accent-soft)"></span>'
+           '<b>planejado</b> (km)</span><span><span class="key" style="background:var(--accent)">'
+           '</span><b>feito</b> (km)</span><span>% em cima = corridas cumpridas</span></div>'
+           f'<div class="fig">{charts.plan_vs_actual(pw)}</div></div>')
     sel_week = next((w for w in mweeks if w["n"] == sel), None)
     zoom = (_week_strip(runs, t["cross"], sel_week["y"], sel) if sel_week else
             '<div class="card" id="semana" style="margin-top:16px">'
@@ -663,6 +756,7 @@ def page_workouts(t: dict[str, Any], week: str | None = None, month: str | None 
       <div class="fig">{charts.volume_bars(mweeks, 'semana', pips=True, week_link=True, selected=sel, month=msel)}</div>
       <p class="cap">Pontos embaixo = treinos na semana · clique numa semana para ampliar.</p></div>
     {zoom}
+    {pva}
     <details class="allruns" style="margin-top:16px"><summary>Ver todas as corridas ({len(runs)})</summary>
       <div class="fig" style="overflow-x:auto;margin-top:12px">{table}</div>
       <p class="cap">TE = Training Effect do Garmin (0–5): impacto aeróbico (resistência) e anaeróbico (alta intensidade).</p></details>"""
@@ -775,6 +869,14 @@ def _ago(iso: str | None) -> str:
     return f"há {int(round(secs / 86400))} dias"
 
 
+def _local_day(iso: str | None) -> str | None:
+    """ISO UTC timestamp -> the local calendar date (YYYY-MM-DD)."""
+    try:
+        return datetime.fromisoformat(iso).astimezone().date().isoformat()  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return None
+
+
 def _hours_since(iso: str | None) -> float | None:
     if not iso:
         return None
@@ -845,7 +947,7 @@ def _sync_header(d: dict[str, Any]) -> str:
         h = _hours_since(last_ok)
         if h is not None and h < 24:
             cls, chip, head = "good", "atualizado", f"Sincronizado {_ago(last_ok)}"
-        elif h is not None and h < 72:
+        elif h is not None and h < STALE_AFTER_HOURS:
             cls, chip, head = "warn", "defasado", f"Último sync {_ago(last_ok)}"
         else:
             cls, chip, head = "warn", "desatualizado", f"Último sync {_ago(last_ok)}"
@@ -1199,6 +1301,24 @@ def importar_aprovar(request: Request) -> RedirectResponse:
     return RedirectResponse(url=f"/relatorios?aprovado={int(approved)}", status_code=303)
 
 
+
+
+@app.post("/alertas/lido")
+def alertas_lido(request: Request) -> RedirectResponse:
+    """Mark one alert (?id=N) or every unread one (?id=todos) as read."""
+    which = request.query_params.get("id", "")
+    conn = get_connection()
+    try:
+        if which == "todos":
+            conn.execute("UPDATE inbox_message SET status='read', read_at=?"
+                         " WHERE status='unread'", (utcnow(),))
+        elif which.isdigit():
+            conn.execute("UPDATE inbox_message SET status='read', read_at=?"
+                         " WHERE id=? AND status='unread'", (utcnow(), int(which)))
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(url="/carga#alertas", status_code=303)
 
 
 @app.post("/sync")

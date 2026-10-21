@@ -7,6 +7,7 @@ marks carry data-tip for hover. No external libs — inline SVG only.
 
 from __future__ import annotations
 
+import html
 import itertools
 from datetime import date
 from typing import Any
@@ -83,7 +84,16 @@ def _month_ticks(lo_ord, hi_ord, x0, x1, y):
     return "".join(out)
 
 
-def load_lines(load: list[dict]) -> str:
+def _tip(markup: str) -> str:
+    """A data-tip attribute value. The tooltip JS renders it as HTML, so any text that
+    came from the database must already be escaped inside `markup`; this escapes once
+    more for the attribute itself."""
+    return html.escape(markup, quote=True)
+
+
+def load_lines(load: list[dict], events: list[dict] | None = None) -> str:
+    """Fitness vs fatigue lines. `events` ({"date", "title", "body"}) are drawn as alert
+    markers on the timeline — what fired, and when, on top of the load that caused it."""
     if not load:
         return _empty("Sem dados de carga ainda — aparecem depois do primeiro sync.")
     W, H = 720, 300
@@ -120,6 +130,55 @@ def load_lines(load: list[dict]) -> str:
     lx = _sx(hi, lo, hi, x0, x1)
     for key, cls in (("ctl", "d-ctl"), ("atl", "d-atl")):
         p.append(f'<circle cx="{lx:.1f}" cy="{_sy(load[-1][key],0,vmax,y0,y1):.1f}" r="3.4" class="{cls}"/>')
+    for ev in events or []:
+        xo = date.fromisoformat(ev["date"]).toordinal()
+        if not lo <= xo <= hi:
+            continue
+        ex = _sx(xo, lo, hi, x0, x1)
+        tip = (f'{_esc_text(ev["date"])}<br><b>{_esc_text(ev["title"])}</b>'
+               f'<br>{_esc_text(ev["body"])}')
+        p.append(f'<line x1="{ex:.1f}" y1="{y1:.1f}" x2="{ex:.1f}" y2="{y0:.1f}" class="ev-line"/>')
+        p.append(f'<path d="M {ex-5:.1f} {y1-6:.1f} L {ex+5:.1f} {y1-6:.1f} L {ex:.1f} {y1+3:.1f} Z" '
+                 f'class="ev-mk hoverable" data-tip="{_tip(tip)}"/>')
+    p.append("</svg>")
+    return "".join(p)
+
+
+def _esc_text(v: Any) -> str:
+    return html.escape("" if v is None else str(v))
+
+
+def plan_vs_actual(weeks: list[dict]) -> str:
+    """Per approved plan week: planned km (light, wide) behind done km (solid), with the
+    share of planned runs completed on top."""
+    if not weeks:
+        return _empty("Nenhum plano aprovado ainda — importe e aprove um em Relatórios.")
+    W, H = 720, 240
+    ml, mr, mt, mb = 30, 12, 26, 30
+    n = len(weeks)
+    vmax = max(max(w["planned_km"], w["done_km"]) for w in weeks) * 1.15 or 1
+    x0, x1, y0, y1 = ml, W - mr, H - mb, mt
+    bw = (x1 - x0) / n
+    p = [_svg(W, H)]
+    for gv in range(0, int(vmax) + 1, 5):
+        y = _sy(gv, 0, vmax, y0, y1)
+        p.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" class="grid-l"/>')
+        p.append(f'<text x="{ml-6}" y="{y+3:.1f}" class="tk tk-r">{gv}</text>')
+    for i, w in enumerate(weeks):
+        cx = x0 + bw * i + bw / 2
+        outer, inner = min(46, bw * 0.7), min(26, bw * 0.4)
+        yp, yd = _sy(w["planned_km"], 0, vmax, y0, y1), _sy(w["done_km"], 0, vmax, y0, y1)
+        pct = f'{w["done_runs"] / w["due_runs"] * 100:.0f}%' if w["due_runs"] else "—"
+        tip = (f'<b>Semana de {_esc_text(w["label"])}</b><br>planejado {w["planned_km"]:.1f} km'
+               f' · feito {w["done_km"]:.1f} km<br>{w["done_runs"]} de {w["due_runs"]} '
+               f'corrida(s) cumprida(s)')
+        p.append(f'<g class="hoverable" data-tip="{_tip(tip)}">'
+                 f'<rect x="{cx-outer/2:.1f}" y="{yp:.1f}" width="{outer:.1f}" '
+                 f'height="{max(0.5, y0-yp):.1f}" rx="4" class="pva-plan"/>'
+                 f'<rect x="{cx-inner/2:.1f}" y="{yd:.1f}" width="{inner:.1f}" '
+                 f'height="{max(0.5, y0-yd):.1f}" rx="3" class="pva-done"/></g>')
+        p.append(f'<text x="{cx:.1f}" y="{min(yp, yd)-6:.1f}" class="note tk-m">{pct}</text>')
+        p.append(f'<text x="{cx:.1f}" y="{H-10}" class="tk tk-m">{_esc_text(w["short"])}</text>')
     p.append("</svg>")
     return "".join(p)
 
@@ -363,6 +422,10 @@ CHART_CSS = """
 .l-ctl{stroke:var(--accent);stroke-width:2.6;stroke-linejoin:round;stroke-linecap:round}
 .l-atl{stroke:var(--mod);stroke-width:1.8;stroke-linejoin:round;opacity:.85}
 .d-ctl{fill:var(--accent)} .d-atl{fill:var(--mod)}
+.ev-line{stroke:var(--alert);stroke-width:1;stroke-dasharray:2 3;opacity:.55}
+.ev-mk{fill:var(--alert)}
+.pva-plan{fill:var(--accent-weak);stroke:var(--accent-soft);stroke-width:1}
+.pva-done{fill:var(--accent)}
 .a-pos{fill:var(--good);opacity:.20} .a-neg{fill:var(--alert);opacity:.16}
 .l-form{stroke:var(--ink-2);stroke-width:1.5;stroke-linejoin:round}
 .b-easy{fill:var(--easy)} .b-mod{fill:var(--mod)} .b-hard{fill:var(--hard)}
