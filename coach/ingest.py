@@ -306,8 +306,8 @@ def _maybe_escalate(conn: sqlite3.Connection, threshold: int = ESCALATION_THRESH
         "INSERT INTO inbox_message (type, title, body, status, created_at)"
         " VALUES ('sync_warning', ?, ?, 'unread', ?)",
         (
-            "Can't reach Garmin",
-            f"The sync failed {threshold} times in a row. Can you check the login/connection?",
+            "Sem conexão com o Garmin",  # user-facing (shown in the dashboard): Portuguese
+            f"O sync falhou {threshold} vezes seguidas. Confira o login ou a conexão.",
             utcnow(),
         ),
     )

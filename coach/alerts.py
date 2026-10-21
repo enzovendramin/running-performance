@@ -27,6 +27,15 @@ from coach.rules import (  # single source of truth for thresholds
 )
 
 
+# Alert titles/messages are user-facing, so they are written in Portuguese (the
+# dashboard's language); rule codes and recovery flag codes stay in English.
+RECOVERY_LABEL_PT = {
+    "resting HR elevated": "FC de repouso elevada",
+    "Body Battery low": "Body Battery baixa",
+    "short sleep": "sono curto",
+}
+
+
 def _week_load(conn: sqlite3.Connection, start_iso: str, end_iso: str) -> float:
     row = conn.execute(
         "SELECT COALESCE(SUM(daily_load), 0) AS s FROM daily_load"
@@ -84,7 +93,8 @@ def evaluate(conn: sqlite3.Connection, today: date | None = None) -> list[dict[s
                            (today - timedelta(days=7)).isoformat())
     ctl, atl, tsb = latest["ctl"], latest["atl"], latest["tsb"]
     recovery = recovery_flags(conn, today)
-    suffix = f" Recovery signals: {', '.join(recovery)}." if recovery else ""
+    suffix = (f" Sinais de recuperação: {', '.join(RECOVERY_LABEL_PT[f] for f in recovery)}."
+              if recovery else "")
     sev = "high" if recovery else "warning"
 
     # Rule 1: acute:chronic ratio (only above the base floor).
@@ -92,10 +102,10 @@ def evaluate(conn: sqlite3.Connection, today: date | None = None) -> list[dict[s
         ratio = atl / ctl
         alerts.append({
             "rule": "acwr_high", "severity": sev,
-            "title": "Acute load well above your base",
-            "message": (f"Fatigue (ATL {atl:.0f}) is {ratio:.2f}x your fitness "
-                        f"(CTL {ctl:.0f}) — above the {ACWR_HIGH:.1f} injury-risk "
-                        f"threshold.{suffix}"),
+            "title": "Carga aguda bem acima da sua base",
+            "message": (f"A fadiga (ATL {atl:.0f}) está {ratio:.2f}× a sua condição "
+                        f"(CTL {ctl:.0f}) — acima do limite de risco de {ACWR_HIGH:.1f}."
+                        f"{suffix}"),
         })
 
     # Rule 2: weekly load jump (works at low base thanks to the minimum floor).
@@ -104,18 +114,18 @@ def evaluate(conn: sqlite3.Connection, today: date | None = None) -> list[dict[s
         jump = (this_week / prev_week - 1) * 100
         alerts.append({
             "rule": "week_jump", "severity": sev,
-            "title": "Big jump in weekly load",
-            "message": (f"This week's load ({this_week:.0f}) is {jump:.0f}% over last "
-                        f"week ({prev_week:.0f}).{suffix}"),
+            "title": "Salto grande na carga semanal",
+            "message": (f"A carga destes 7 dias ({this_week:.0f}) está {jump:.0f}% acima "
+                        f"dos 7 anteriores ({prev_week:.0f}).{suffix}"),
         })
 
     # Rule 3: deep fatigue / overreaching (form very negative).
     if tsb <= TSB_DEEP:
         alerts.append({
             "rule": "tsb_deep", "severity": sev,
-            "title": "Accumulated fatigue",
-            "message": (f"Form (TSB {tsb:.0f}) is deep in the hole — sustained fatigue "
-                        f"beyond recovery.{suffix}"),
+            "title": "Fadiga acumulada",
+            "message": (f"A forma (TSB {tsb:.0f}) está muito negativa — fadiga sustentada, "
+                        f"além do que o corpo recupera.{suffix}"),
         })
 
     return alerts

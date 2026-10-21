@@ -36,7 +36,10 @@ def test_poor_recovery_raises_severity(db: sqlite3.Connection, now: str) -> None
                    ((today - timedelta(days=i)).isoformat(), now))
     assert alerts.recovery_flags(db, today) == [
         "Body Battery low", "resting HR elevated", "short sleep"]
-    assert {a["severity"] for a in alerts.evaluate(db, today=today)} == {"high"}
+    fired = alerts.evaluate(db, today=today)
+    assert {a["severity"] for a in fired} == {"high"}
+    # the text is user-facing, so it is in Portuguese (the dashboard's language)
+    assert all("Sinais de recuperação: Body Battery baixa" in a["message"] for a in fired)
 
 
 def test_an_old_night_never_counts_as_recent(db: sqlite3.Connection, now: str) -> None:
