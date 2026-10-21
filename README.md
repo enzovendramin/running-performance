@@ -56,6 +56,15 @@ python -m coach.daily      # full update: sync -> load -> match -> alerts
 python -m coach.web        # local dashboard at http://127.0.0.1:8000
 ```
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest                     # every test runs on a throwaway database — coach.db is never touched
+```
+
+The suite also runs on GitHub Actions on every push.
+
 Schedule `coach.daily` (Windows Task Scheduler or `cron`) to keep the data fresh
 automatically.
 
@@ -66,7 +75,7 @@ and never leave your machine.
 
 ## Stack
 
-Python 3.11+ · SQLite · [`garminconnect`](https://github.com/cyberjunky/python-garminconnect)
+Python 3.12+ · SQLite · [`garminconnect`](https://github.com/cyberjunky/python-garminconnect)
 · FastAPI + uvicorn. Server-rendered HTML with inline SVG charts — no SPA, no CDN.
 
 Personal, single-user project.

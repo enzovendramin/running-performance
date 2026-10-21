@@ -1,10 +1,10 @@
-# Project dependencies.
+# Project dependencies (pinned so a new upstream release can't silently break the app).
 
 # Garmin data ingestion (unofficial library, free) + env/config.
-garminconnect
-python-dotenv
+garminconnect==0.3.6
+python-dotenv==1.2.2
 
 # Local dashboard: FastAPI app (no SPA, no auth, no external CDN).
-fastapi
-uvicorn
-python-multipart
+fastapi==0.139.0
+uvicorn==0.51.0
+python-multipart==0.0.32
