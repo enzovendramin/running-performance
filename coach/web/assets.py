@@ -1,11 +1,11 @@
 """Static assets for the local dashboard: the white+purple design system and the
-interaction JS (hover tooltip, view toggles). Inlined so the site runs fully offline
-(no CDN) — important for a possible Raspberry Pi move."""
+interaction JS (hover tooltip, sync progress, sleep detail panel). Inlined so the site
+runs fully offline (no CDN) — important for a possible Raspberry Pi move."""
 
 from __future__ import annotations
 
-# Light-first, clean white with purple accents (per the user's brief). Dark is provided
-# but secondary. Purple is the single accent; semantic colors are reserved and separate.
+# Clean white with purple accents (per the user's brief). Purple is the single accent;
+# semantic colors (good/warn/alert) are reserved and separate.
 CSS = """
 :root{
   --plane:#f6f3fc; --surface:#ffffff; --surface-2:#f5f1fd; --inset:#faf8ff;
@@ -17,17 +17,6 @@ CSS = """
   --alert:#e0483f; --alert-weak:#fbe6e4;
   --easy:#6d43e8; --mod:#dd8a0b; --hard:#e0483f; --violet:#7c4dff; --teal:#0e9c8a;
   --shadow:0 1px 2px rgba(27,22,48,.04),0 4px 16px rgba(27,22,48,.05);
-}
-:root[data-theme="dark"]{
-  --plane:#131019; --surface:#1b1726; --surface-2:#221c31; --inset:#191423;
-  --ink:#f1ecfb; --ink-2:#c3bad9; --muted:#8f87a6; --line:#2b2440;
-  --grid:#241d36; --axis:#3a3155;
-  --accent:#8b6bf0; --accent-strong:#a68cf5; --accent-weak:#241c3a; --accent-soft:#33285a;
-  --seq-1:#3a2d63; --seq-2:#5a41a6; --seq-3:#8b6bf0; --seq-4:#b9a3f7;
-  --good:#2bb668; --good-weak:#16301f; --warn:#e0a53a; --warn-weak:#2f2410;
-  --alert:#ef6a62; --alert-weak:#33191a;
-  --easy:#8b6bf0; --mod:#e0a53a; --hard:#ef6a62; --violet:#a68cf5; --teal:#2bb6a2;
-  --shadow:0 1px 2px rgba(0,0,0,.3);
 }
 *{box-sizing:border-box}
 html,body{margin:0}
@@ -121,13 +110,6 @@ h2{font-size:19px;letter-spacing:-.01em;margin:0 0 3px;font-weight:680}
 .mnav:hover{background:var(--accent-weak);color:var(--accent-strong)}
 .mnav.off{opacity:.35;pointer-events:none}
 .mnav-lbl{font-weight:640;font-size:14.5px;min-width:118px;text-align:center}
-
-/* ---- toggle ---- */
-.seg{display:inline-flex;background:var(--surface-2);border:1px solid var(--line);
-  border-radius:10px;padding:3px;gap:2px}
-.seg button{border:0;background:transparent;color:var(--ink-2);font:inherit;font-size:13px;
-  font-weight:600;padding:5px 14px;border-radius:8px;cursor:pointer}
-.seg button.on{background:var(--surface);color:var(--accent-strong);box-shadow:var(--shadow)}
 
 /* ---- tables ---- */
 .tbl{width:100%;border-collapse:collapse;font-size:13px}
@@ -290,7 +272,7 @@ h2{font-size:19px;letter-spacing:-.01em;margin:0 0 3px;font-weight:680}
   .plan,.rgrid{grid-template-columns:repeat(2,1fr)}}
 """
 
-# Hover tooltip (any element with data-tip), and simple client-side view toggles.
+# Hover tooltip (any element with data-tip), sync-button progress, sleep detail panel.
 JS = """
 (function(){
   var tip=document.createElement('div'); tip.id='tip'; document.body.appendChild(tip);
@@ -332,16 +314,6 @@ JS = """
       document.querySelectorAll('.sleep-bar.on').forEach(function(x){x.classList.remove('on');});
       el.classList.add('on');
     });
-  });
-
-  // segmented toggles: button[data-toggle="groupId"][data-view="x"] shows [data-group][data-view]
-  document.addEventListener('click',function(e){
-    var b=e.target.closest('[data-toggle]'); if(!b)return;
-    var g=b.getAttribute('data-toggle'), v=b.getAttribute('data-view');
-    document.querySelectorAll('[data-toggle="'+g+'"]').forEach(function(x){
-      x.classList.toggle('on', x===b);});
-    document.querySelectorAll('[data-group="'+g+'"]').forEach(function(x){
-      x.style.display = (x.getAttribute('data-view')===v)?'':'none';});
   });
 })();
 """

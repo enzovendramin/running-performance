@@ -27,6 +27,11 @@ def _svg(w, h):
             f'class="chart" role="img">')
 
 
+def _empty(msg: str) -> str:
+    """Placeholder for a chart with no data yet (e.g. a fresh install before the first sync)."""
+    return f'<p class="empty">{msg}</p>'
+
+
 # ---------------------------------------------------------------- gauge -------
 def gauge(label: str, value: str, tag: str, tag_kind: str, lo: float, hi: float,
           marker: float, zones: list[tuple[float, str]], ends: tuple[str, str],
@@ -60,20 +65,27 @@ def gauge(label: str, value: str, tag: str, tag_kind: str, lo: float, hi: float,
 
 
 # ------------------------------------------------- load: CTL vs ATL lines -----
-def _month_ticks(lo_ord, hi_ord, x0, x1, y, months):
+_PT_MONTHS = ["jan", "fev", "mar", "abr", "mai", "jun",
+              "jul", "ago", "set", "out", "nov", "dez"]
+
+
+def _month_ticks(lo_ord, hi_ord, x0, x1, y):
+    """A label on the 1st of every month inside the charted date range (January also
+    shows the year, so a multi-year axis stays readable)."""
     out = []
-    for mo, lbl in months:
-        xo = date(2026, mo, 1).toordinal()
-        if lo_ord <= xo <= hi_ord:
-            x = _sx(xo, lo_ord, hi_ord, x0, x1)
+    d = date.fromordinal(lo_ord).replace(day=1)
+    while d.toordinal() <= hi_ord:
+        if d.toordinal() >= lo_ord:
+            x = _sx(d.toordinal(), lo_ord, hi_ord, x0, x1)
+            lbl = _PT_MONTHS[d.month - 1] + (f" {d.year % 100:02d}" if d.month == 1 else "")
             out.append(f'<text x="{x:.1f}" y="{y}" class="tk tk-m">{lbl}</text>')
+        d = date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
     return "".join(out)
 
 
-MONTHS = [(3, "mar"), (4, "abr"), (5, "mai"), (6, "jun"), (7, "jul"), (8, "ago")]
-
-
 def load_lines(load: list[dict]) -> str:
+    if not load:
+        return _empty("Sem dados de carga ainda — aparecem depois do primeiro sync.")
     W, H = 720, 300
     ml, mr, mt, mb = 34, 14, 16, 30
     xs = [date.fromisoformat(x["date"]).toordinal() for x in load]
@@ -85,14 +97,14 @@ def load_lines(load: list[dict]) -> str:
         y = _sy(gv, 0, vmax, y0, y1)
         p.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" class="grid-l"/>')
         p.append(f'<text x="{ml-6}" y="{y+3:.1f}" class="tk tk-r">{gv}</text>')
-    p.append(_month_ticks(lo, hi, x0, x1, H - 10, MONTHS))
+    p.append(_month_ticks(lo, hi, x0, x1, H - 10))
     def poly(key, cls):
         pts = " ".join(f"{_sx(date.fromisoformat(x['date']).toordinal(),lo,hi,x0,x1):.1f},"
                        f"{_sy(x[key],0,vmax,y0,y1):.1f}" for x in load)
         return f'<polyline points="{pts}" fill="none" class="{cls}"/>'
     p.append(poly("atl", "l-atl"))
     p.append(poly("ctl", "l-ctl"))
-    # sparse hover dots (every ~5th day) to keep it light
+    # sparse hover dots (every 4th day + the last one) to keep it light
     for i, x in enumerate(load):
         if i % 4 and i != len(load) - 1:
             continue
@@ -113,6 +125,8 @@ def load_lines(load: list[dict]) -> str:
 
 
 def form_area(load: list[dict]) -> str:
+    if not load:
+        return _empty("Sem dados de forma ainda — aparecem depois do primeiro sync.")
     W, H = 720, 150
     ml, mr, mt, mb = 30, 14, 10, 24
     xs = [date.fromisoformat(x["date"]).toordinal() for x in load]
@@ -132,7 +146,7 @@ def form_area(load: list[dict]) -> str:
     p.append(f'<path d="{pos}" class="a-pos"/>')
     p.append(f'<line x1="{ml}" y1="{yz:.1f}" x2="{x1}" y2="{yz:.1f}" class="axis-l"/>')
     p.append(f'<polyline points="{line}" fill="none" class="l-form"/>')
-    p.append(_month_ticks(lo, hi, x0, x1, H - 8, MONTHS))
+    p.append(_month_ticks(lo, hi, x0, x1, H - 8))
     p.append("</svg>")
     return "".join(p)
 
@@ -208,6 +222,8 @@ def volume_bars(items: list[dict], span_label: str, *, pips: bool = False,
 
 # --------------------------------------------------- resting HR recovery ------
 def rhr_line(rows: list[dict]) -> str:
+    if not rows:
+        return _empty("Sem FC de repouso registrada ainda.")
     W, H = 720, 230
     ml, mr, mt, mb = 30, 14, 18, 26
     xs = [date.fromisoformat(w["date"]).toordinal() for w in rows]
@@ -231,12 +247,14 @@ def rhr_line(rows: list[dict]) -> str:
         tip = f'{w["date"]}<br><b>{w["resting_hr"]} bpm</b>'
         p.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{4 if hot else 3}" '
                  f'class="{"d-hot" if hot else "d-rhr"} hoverable" data-tip="{tip}"/>')
-    p.append(_month_ticks(lo, hi, x0, x1, H - 8, MONTHS))
+    p.append(_month_ticks(lo, hi, x0, x1, H - 8))
     p.append("</svg>")
     return "".join(p)
 
 
 def bb_range(rows: list[dict]) -> str:
+    if not rows:
+        return _empty("Sem dados de Body Battery ainda.")
     W, H = 720, 240
     ml, mr, mt, mb = 26, 14, 16, 30
     n = len(rows)

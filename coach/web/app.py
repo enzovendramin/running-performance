@@ -10,12 +10,11 @@ Run (offline):  python -m coach.web  ->  http://127.0.0.1:8000
 from __future__ import annotations
 
 import html
-import json
 import re
 import sqlite3
-from collections import defaultdict
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -23,19 +22,27 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from coach import alerts as alertmod
+from coach import rules
 from coach.db import get_connection, run_migrations
 from coach.web import charts
 from coach.web.assets import CSS, JS
 
-app = FastAPI(title="Coach")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Apply pending migrations once when the server starts — not on every request."""
+    conn = get_connection()
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
+    yield
+
+
+app = FastAPI(title="Coach", lifespan=lifespan)
 
 # ---------------------------------------------------------------- helpers -----
-PT_MONTH = {1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
-            7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"}
-PT_MONTH_SHORT = {1: "jan", 2: "fev", 3: "mar", 4: "abr", 5: "mai", 6: "jun",
-                  7: "jul", 8: "ago", 9: "set", 10: "out", 11: "nov", 12: "dez"}
 PT_WD = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
-REPORTS_DIR = Path(__file__).resolve().parent.parent.parent / "reports"
 
 
 def _esc(v: Any) -> str:
@@ -43,9 +50,7 @@ def _esc(v: Any) -> str:
 
 
 def _zone(hr: int | None) -> str:
-    if hr is None:
-        return "na"
-    return "easy" if hr < 145 else ("mod" if hr <= 165 else "hard")
+    return rules.intensity_zone(hr) or "na"  # "na" = no HR data
 
 
 def _pace(spd: float | None) -> str | None:
@@ -89,36 +94,14 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
         "SELECT date, time_5k_s, time_10k_s, time_half_s, time_marathon_s"
         " FROM race_prediction ORDER BY date")]
 
-    # weekly (ISO) + monthly, each split by intensity zone
-    def bucketize(keyfn, labelfn, shortfn):
-        b = defaultdict(lambda: {"km": 0.0, "runs": 0, "easy": 0.0, "mod": 0.0, "hard": 0.0})
-        for a in acts:
-            k = keyfn(a["d"])
-            b[k]["km"] += a["km"]; b[k]["runs"] += 1
-            if a["zone"] in ("easy", "mod", "hard"):
-                b[k][a["zone"]] += a["km"]
-        return b
-
-    wk = bucketize(lambda d: d.isocalendar()[1], None, None)
-    iso_year, cur_wk = date.today().isocalendar()[0], date.today().isocalendar()[1]
-    first_wk = min((a["d"].isocalendar()[1] for a in acts
-                    if a["d"].isocalendar()[0] == iso_year), default=cur_wk)
-    weekly = []
-    for n in range(max(first_wk, cur_wk - 19), cur_wk + 1):  # rolling window up to this week
-        v = wk.get(n, {"km": 0.0, "runs": 0, "easy": 0.0, "mod": 0.0, "hard": 0.0})
-        seg = date.fromisocalendar(iso_year, n, 1)   # ISO Monday
-        end = date.fromisocalendar(iso_year, n, 7)   # ISO Sunday
-        rng = (f"{seg.day}–{end.day} {_MONTHS_ABBR[end.month]}" if seg.month == end.month
-               else f"{seg.day} {_MONTHS_ABBR[seg.month]}–{end.day} {_MONTHS_ABBR[end.month]}")
-        weekly.append({"label": f"Semana {n} · {rng}", "short": f"{seg.day}/{seg.month}",
-                       "range": rng, "n": n, "end": end.isoformat(),
-                       "completed": end < date.today(), **v})
-
-    mo = bucketize(lambda d: d.month, None, None)
-    monthly = []
-    for m in sorted(mo):
-        v = mo[m]
-        monthly.append({"label": PT_MONTH[m], "short": PT_MONTH_SHORT[m], **v})
+    # weekly volume: a rolling window of the last 20 ISO weeks (Mon–Sun) up to this one,
+    # stepping back by Mondays so the year boundary is handled by the calendar itself
+    today = date.today()
+    this_monday = today - timedelta(days=today.weekday())
+    first_monday = min((a["d"] - timedelta(days=a["d"].weekday()) for a in acts),
+                       default=this_monday)
+    mondays = [this_monday - timedelta(weeks=k) for k in range(19, -1, -1)]
+    weekly = [_week_summary(acts, m) for m in mondays if m >= first_monday]
 
     rhr = [w for w in well if w["resting_hr"] is not None][-40:]
     bb = [w for w in well if w["body_battery_high"] is not None][-18:]
@@ -139,9 +122,14 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
             "awake_hm": _fmt_sleep(w["awake_sleep_seconds"]),
             "hr_avg": w["sleep_hr_avg"], "hr_min": w["sleep_hr_min"]})
 
-    # active plan + per-day done flag (matched by an activity on that date)
-    plan = conn.execute("SELECT * FROM weekly_plan WHERE status IN ('active','proposed')"
-                        " ORDER BY created_at DESC LIMIT 1").fetchone()
+    # The current week's plan, else the next upcoming one (approved before proposed).
+    # The per-day done flag is coach.matching's status, so a run done a day off-plan
+    # still counts and a run on a rest day doesn't tick anything.
+    plan = conn.execute(
+        "SELECT * FROM weekly_plan WHERE week_start_date >= ?"
+        " AND status IN ('active','proposed')"
+        " ORDER BY week_start_date, status = 'active' DESC, created_at DESC LIMIT 1",
+        (this_monday.isoformat(),)).fetchone()
     pworkouts = []
     if plan:
         seen = set()
@@ -150,27 +138,40 @@ def load_data(conn: sqlite3.Connection) -> dict[str, Any]:
             if w["date"] in seen:  # de-dupe (older builds inserted twice)
                 continue
             seen.add(w["date"])
-            done = conn.execute("SELECT 1 FROM activity WHERE substr(start_time_local,1,10)=?"
-                                " AND type='running' LIMIT 1", (w["date"],)).fetchone() is not None
-            pworkouts.append({**dict(w), "done": done})
+            pworkouts.append({**dict(w), "done": w["status"] in ("completed", "modified")})
+
+    # proposals still waiting for approval (listed in Relatórios with an approve button)
+    pending = []
+    for p in conn.execute("SELECT id, week_start_date FROM weekly_plan"
+                          " WHERE status='proposed' ORDER BY week_start_date DESC"):
+        runs = [w for w in conn.execute(
+                    "SELECT type, target_distance_m FROM planned_workout WHERE weekly_plan_id=?",
+                    (p["id"],)) if rules.is_running(w["type"])]
+        replaces = conn.execute("SELECT 1 FROM weekly_plan WHERE week_start_date=?"
+                                " AND status='active'", (p["week_start_date"],)).fetchone()
+        pending.append({"id": p["id"], "week_start": p["week_start_date"], "runs": len(runs),
+                        "km": sum(w["target_distance_m"] or 0 for w in runs) / 1000,
+                        "replaces": replaces is not None})
 
     fired = alertmod.evaluate(conn, date.today())
     recovery = alertmod.recovery_flags(conn)
 
     total_km = round(sum(a["km"] for a in acts), 1)
-    n_weeks = 17
-    per_week = round(len(acts) / n_weeks, 1)
+    # runs per week = the current habit: mean of the last 4 completed weeks (zeros count)
+    recent = [w for w in weekly if w["completed"]][-4:]
+    per_week = round(sum(w["runs"] for w in recent) / len(recent), 1) if recent else 0.0
     return {
         "profile": dict(prof) if prof else {},
-        "runs": acts, "load": load, "weekly": weekly, "monthly": monthly,
+        "runs": acts, "load": load, "weekly": weekly,
         "rhr": rhr, "bb": bb, "sleep": sleep, "races": races, "cross": cross,
-        "plan": plan, "pworkouts": pworkouts,
+        "plan": plan, "pworkouts": pworkouts, "pending": pending,
         "alerts": fired, "recovery": recovery,
         "totals": {"km": total_km, "runs": len(acts), "per_week": per_week,
                    "ctl": load[-1]["ctl"] if load else 0, "atl": load[-1]["atl"] if load else 0,
                    "tsb": load[-1]["tsb"] if load else 0,
                    "ctl_peak": max((x["ctl"] for x in load), default=0),
-                   "vo2max": (dict(prof).get("vo2max") if prof else None)},
+                   "vo2max": prof["vo2max"] if prof else None,
+                   "fitness_age": prof["fitness_age"] if prof else None},
     }
 
 
@@ -180,6 +181,11 @@ def build_gauges(t: dict[str, Any]) -> dict[str, str]:
     ctl_tag = ("muito baixa", "warn") if ctl < 15 else (("moderada", "accent") if ctl < 30 else ("boa", "good"))
     tsb_tag = ("fatigado", "alert") if tsb < -10 else (("fresco", "accent") if tsb > 5 else ("equilibrada", "good"))
     pw_tag = ("abaixo da meta", "warn") if pw < 2.5 else (("no alvo", "good") if pw <= 4 else ("alto", "accent"))
+    # VO2max tag follows the gauge's own zone boundaries (42 / 50 / 58)
+    vo2_tag = (("—", "accent") if not vo2 else ("regular", "warn") if vo2 < 42 else
+               ("bom", "accent") if vo2 < 50 else ("muito bom", "good") if vo2 < 58 else
+               ("elite", "good"))
+    age = t["fitness_age"]
     return {
         "ctl": charts.gauge(
             "Condição (fitness)", f"{ctl:.1f}", ctl_tag[0], ctl_tag[1], 0, 50, ctl,
@@ -192,11 +198,11 @@ def build_gauges(t: dict[str, Any]) -> dict[str, str]:
         "week": charts.gauge(
             "Treinos por semana", f"{pw:.1f}", pw_tag[0], pw_tag[1], 0, 5, pw,
             [(2.5, "var(--warn-weak)"), (4, "var(--good-weak)"), (5, "var(--accent-weak)")],
-            ("0", "5×"), "Meta para reconstruir a base: 3× por semana"),
+            ("0", "5×"), "Média das últimas 4 semanas · meta para a base: 3×"),
         "vo2": charts.gauge(
-            "VO₂max", f"{vo2:.0f}" if vo2 else "—", "elite", "good", 35, 65, vo2 or 35,
+            "VO₂max", f"{vo2:.0f}" if vo2 else "—", vo2_tag[0], vo2_tag[1], 35, 65, vo2 or 35,
             [(42, "var(--seq-1)"), (50, "var(--seq-2)"), (58, "var(--seq-3)"), (65, "var(--seq-4)")],
-            ("35", "elite"), "Seu motor — idade fitness 20"),
+            ("35", "elite"), f"Seu motor — idade fitness {age}" if age else "Seu motor"),
     }
 
 
@@ -207,13 +213,12 @@ PT_TYPE = {"easy": "fácil", "long": "longo", "rest": "descanso", "tempo": "temp
 
 
 def _plan_cat(typ: str) -> str:
-    if typ in ("rest", "off"):
+    """Display category of a planned workout, from the shared rules."""
+    if rules.is_rest(typ):
         return "rest"
-    if typ in ("strength", "mobility", "cross"):
+    if rules.is_support(typ):
         return "support"
-    if typ in ("tempo", "intervals", "threshold", "repetitions", "fartlek", "hard", "race", "hills"):
-        return "quality"
-    return "run"
+    return "quality" if rules.is_quality(typ) else "run"
 
 
 def _fmt_pace_range(lo: float | None, hi: float | None) -> str | None:
@@ -342,9 +347,9 @@ def _alerts_block(t: dict[str, Any]) -> str:
 
 INTENSITY_LEGEND = (
     '<div class="legend">'
-    '<span><span class="key" style="background:var(--easy)"></span><b>fácil</b> &lt;145</span>'
-    '<span><span class="key" style="background:var(--mod)"></span><b>moderado</b> 145–165</span>'
-    '<span><span class="key" style="background:var(--hard)"></span><b>forte</b> &gt;165 bpm</span></div>')
+    f'<span><span class="key" style="background:var(--easy)"></span><b>fácil</b> &lt;{rules.EASY_HR_BELOW}</span>'
+    f'<span><span class="key" style="background:var(--mod)"></span><b>moderado</b> {rules.EASY_HR_BELOW}–{rules.MOD_HR_MAX}</span>'
+    f'<span><span class="key" style="background:var(--hard)"></span><b>forte</b> &gt;{rules.MOD_HR_MAX} bpm</span></div>')
 
 
 def _hms(sec: int | None) -> str:
@@ -389,6 +394,13 @@ def _race_card(races: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------- pages -------
 def page_overview(t: dict[str, Any]) -> str:
     g = build_gauges(t["totals"])
+    plan_title, plan_hint = "Esta semana", "Nenhum plano para esta semana."
+    if t["plan"]:
+        ws = date.fromisoformat(t["plan"]["week_start_date"])
+        if ws > date.today():
+            plan_title = f"Próxima semana · {_dm(ws)}"
+        plan_hint = ("Plano proposto — ainda não aprovado." if t["plan"]["status"] == "proposed"
+                     else "Plano ativo — ✓ = já feito.")
     wa_btn = ""
     if t["plan"] and t["pworkouts"]:
         watext = _whatsapp_plan_text(dict(t["plan"]), t["pworkouts"])
@@ -411,8 +423,8 @@ def page_overview(t: dict[str, Any]) -> str:
     <div class="grid g2" style="margin-top:16px">
       <div class="card span2">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-          <div><h2 style="margin:0">Esta semana</h2>
-            <p class="hint" style="margin-top:2px">Plano ativo — ✓ = já feito.</p></div>
+          <div><h2 style="margin:0">{plan_title}</h2>
+            <p class="hint" style="margin-top:2px">{plan_hint}</p></div>
           {wa_btn}</div>
         {_plan_strip(t)}</div>
     </div>
@@ -502,8 +514,9 @@ _CROSS_PT = {"cycling": "bike", "indoor_cycling": "bike", "lap_swimming": "nata�
              "walking": "caminhada", "hiking": "caminhada"}
 
 
-def _week_strip(runs: list[dict[str, Any]], cross: list[dict[str, Any]], week: int) -> str:
-    start, end = date.fromisocalendar(2026, week, 1), date.fromisocalendar(2026, week, 7)
+def _week_strip(runs: list[dict[str, Any]], cross: list[dict[str, Any]],
+                iso_year: int, week: int) -> str:
+    start, end = date.fromisocalendar(iso_year, week, 1), date.fromisocalendar(iso_year, week, 7)
     today = date.today()
     tag = " · em andamento" if end >= today else ""
     header = f'Semana {week} · {_dm(start)}–{_dm(end)}{tag}'
@@ -519,7 +532,7 @@ def _week_strip(runs: list[dict[str, Any]], cross: list[dict[str, Any]], week: i
             cross_by.setdefault(a["d"].isoformat(), []).append(a)
     cells = []
     for i in range(7):
-        dd = date.fromisocalendar(2026, week, i + 1)
+        dd = start + timedelta(days=i)
         wd, key = PT_WD[dd.weekday()], dd.isoformat()
         if dd > today:  # future day of the current week
             cells.append(
@@ -555,42 +568,50 @@ _MONTH_FULL = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
 
 
+def _week_summary(runs: list[dict[str, Any]], monday: date) -> dict[str, Any]:
+    """Running volume of one ISO week (Mon–Sun), split by intensity zone."""
+    end = monday + timedelta(days=6)
+    wr = [r for r in runs if monday <= r["d"] <= end]
+    iso_year, n, _ = monday.isocalendar()
+    rng = (f"{monday.day}–{end.day} {_MONTHS_ABBR[end.month]}" if monday.month == end.month
+           else f"{monday.day} {_MONTHS_ABBR[monday.month]}–{end.day} {_MONTHS_ABBR[end.month]}")
+    short = (f"{monday.day}–{end.day}/{monday.month}" if monday.month == end.month
+             else f"{monday.day}/{monday.month}–{end.day}/{end.month}")
+    return {
+        "y": iso_year, "n": n, "short": short, "range": rng,
+        "label": f"Semana {n} · {rng}", "end": end.isoformat(),
+        "completed": end < date.today(), "started": monday <= date.today(),
+        "km": sum(r["km"] for r in wr), "runs": len(wr),
+        "easy": sum(r["km"] for r in wr if r["zone"] == "easy"),
+        "mod": sum(r["km"] for r in wr if r["zone"] == "mod"),
+        "hard": sum(r["km"] for r in wr if r["zone"] == "hard")}
+
+
 def _month_weeks(runs: list[dict[str, Any]], y: int, m: int) -> list[dict[str, Any]]:
     """Weekly aggregates for the ISO weeks that overlap the month (y, m)."""
     first = date(y, m, 1)
     last = (date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)) - timedelta(days=1)
-    d = date.fromisocalendar(*first.isocalendar()[:2], 1)          # Monday of the first ISO week
-    end_monday = date.fromisocalendar(*last.isocalendar()[:2], 1)  # Monday of the last ISO week
+    d = first - timedelta(days=first.weekday())     # Monday of the first ISO week
+    end_monday = last - timedelta(days=last.weekday())
     weeks = []
     while d <= end_monday:
-        seg, end = d, d + timedelta(days=6)
-        wr = [r for r in runs if seg <= r["d"] <= end]
-        rng = (f"{seg.day}–{end.day} {_MONTHS_ABBR[end.month]}" if seg.month == end.month
-               else f"{seg.day} {_MONTHS_ABBR[seg.month]}–{end.day} {_MONTHS_ABBR[end.month]}")
-        short = (f"{seg.day}–{end.day}/{seg.month}" if seg.month == end.month
-                 else f"{seg.day}/{seg.month}–{end.day}/{end.month}")
-        weeks.append({
-            "n": seg.isocalendar()[1], "short": short, "range": rng,
-            "label": f"Semana {seg.isocalendar()[1]} · {rng}", "end": end.isoformat(),
-            "completed": end < date.today(), "started": seg <= date.today(),
-            "km": sum(r["km"] for r in wr), "runs": len(wr),
-            "easy": sum(r["km"] for r in wr if r["zone"] == "easy"),
-            "mod": sum(r["km"] for r in wr if r["zone"] == "mod"),
-            "hard": sum(r["km"] for r in wr if r["zone"] == "hard")})
+        weeks.append(_week_summary(runs, d))
         d += timedelta(days=7)
     return weeks
 
 
 def page_workouts(t: dict[str, Any], week: str | None = None, month: str | None = None) -> str:
     runs, today = t["runs"], date.today()
+    latest = runs[-1]["d"] if runs else today
+    y, mo = latest.year, latest.month          # default: the month of the latest run
     if month and re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
         y, mo = int(month[:4]), int(month[5:7])
     elif week and week.isdigit():
-        wd = date.fromisocalendar(today.isocalendar()[0], int(week), 1)
-        y, mo = wd.year, wd.month
-    else:
-        latest = runs[-1]["d"] if runs else today
-        y, mo = latest.year, latest.month
+        try:
+            wd = date.fromisocalendar(today.isocalendar()[0], int(week), 1)
+            y, mo = wd.year, wd.month
+        except ValueError:  # not a real ISO week (e.g. ?w=60): keep the default month
+            pass
     msel = f"{y:04d}-{mo:02d}"
     mweeks = _month_weeks(runs, y, mo)
 
@@ -626,7 +647,8 @@ def page_workouts(t: dict[str, Any], week: str | None = None, month: str | None 
              '<th class="num" data-tip="Training Effect anaeróbico do Garmin (0–5): carga de '
              'alta intensidade / potência da corrida">TE anaer.</th>'
              f'<th>Zona</th></tr></thead><tbody>{"".join(rows)}</tbody></table>')
-    zoom = (_week_strip(runs, t["cross"], sel) if sel else
+    sel_week = next((w for w in mweeks if w["n"] == sel), None)
+    zoom = (_week_strip(runs, t["cross"], sel_week["y"], sel) if sel_week else
             '<div class="card" id="semana" style="margin-top:16px">'
             '<p class="empty">Nenhuma corrida neste mês.</p></div>')
     return f"""
@@ -660,6 +682,31 @@ def _sleep_panel_html(n: dict[str, Any]) -> str:
             f'<span class="sd-min">(mín {n["hr_min"] or "—"})</span></div>')
 
 
+def _pending_plans(pending: list[dict[str, Any]]) -> str:
+    """Card listing proposals that passed the verifier but were never approved."""
+    if not pending:
+        return ""
+    rows = []
+    for p in pending:
+        ws = date.fromisoformat(p["week_start"])
+        notes = [f'{p["runs"]} corrida(s)',
+                 f'{("%g" % round(p["km"], 1)).replace(".", ",")} km']
+        if ws + timedelta(days=6) < date.today():
+            notes.append("semana já passou")
+        if p["replaces"]:
+            notes.append("substitui o plano ativo da semana")
+        rows.append(
+            f'<div class="ritem"><div><b>Semana de {_dm(ws)}</b><br>'
+            f'<span class="hint">{_esc(" · ".join(notes))}</span></div>'
+            f'<form method="post" action="/importar/aprovar?id={p["id"]}">'
+            '<button class="pill solid" style="border:0;cursor:pointer">Aprovar</button>'
+            '</form></div>')
+    return ('<div class="card" style="margin-top:16px"><h2>Planos aguardando aprovação</h2>'
+            '<p class="hint">Já passaram pelo verificador, mas só um plano aprovado é rastreado'
+            ' (planejado vs. real).</p>'
+            f'<div class="rlist" style="margin-top:10px">{"".join(rows)}</div></div>')
+
+
 def page_reports(t: dict[str, Any]) -> str:
     plan = t["plan"]
     plan_line = (f'Plano ativo: semana de {_esc(plan["week_start_date"])}.' if plan
@@ -679,6 +726,7 @@ def page_reports(t: dict[str, Any]) -> str:
           bloqueia antes de gravar, e você aprova.</p>
         <a class="pill solid" style="{btn}" href="/importar">Importar plano →</a></div>
     </div>
+    {_pending_plans(t["pending"])}
     <div class="card" style="margin-top:16px"><h2>Como funciona</h2>
       <p class="hint">Sincronize os dados → <b>gere o snapshot</b> → cole no Project do Claude
         (seu coach) → ele devolve o plano em JSON → <b>importe e aprove</b> aqui. A partir daí o
@@ -949,14 +997,20 @@ def shell(active: str, title: str, body: str) -> str:
         f"<script>{JS}</script>")
 
 
-def _render(active: str, title: str, page_fn, banner: str = "") -> str:
+def _render(
+    active: str,
+    title: str,
+    page_fn: Callable[[dict[str, Any]], str],
+    banner: str = "",
+    loader: Callable[[sqlite3.Connection], dict[str, Any]] = load_data,
+) -> str:
+    """Open the DB, load the page's data, build the page, and wrap it in the shell."""
     conn = get_connection()
     try:
-        run_migrations(conn)
-        t = load_data(conn)
+        data = loader(conn)
     finally:
         conn.close()
-    return shell(active, title, banner + page_fn(t))
+    return shell(active, title, banner + page_fn(data))
 
 
 # --------------------------------------------------------------- feedback -----
@@ -1001,14 +1055,8 @@ def carga() -> str:
 
 @app.get("/treinos", response_class=HTMLResponse)
 def treinos(request: Request) -> str:
-    conn = get_connection()
-    try:
-        run_migrations(conn)
-        t = load_data(conn)
-    finally:
-        conn.close()
-    return shell("/treinos", "Treinos",
-                 page_workouts(t, request.query_params.get("w"), request.query_params.get("m")))
+    qp = request.query_params
+    return _render("/treinos", "Treinos", lambda t: page_workouts(t, qp.get("w"), qp.get("m")))
 
 
 @app.get("/recuperacao")
@@ -1017,20 +1065,21 @@ def recuperacao() -> RedirectResponse:
 
 
 @app.get("/relatorios", response_class=HTMLResponse)
-def relatorios() -> str:
-    return _render("/relatorios", "Relatórios", page_reports)
+def relatorios(request: Request) -> str:
+    approved = request.query_params.get("aprovado")
+    banner = (_banner("ok", "Plano aprovado",
+                      "Está ativo — o painel vai rastrear planejado vs. real.")
+              if approved == "1" else
+              _banner("err", "Não foi possível aprovar",
+                      "Esse plano não está mais aguardando aprovação.")
+              if approved == "0" else "")
+    return _render("/relatorios", "Relatórios", page_reports, banner)
 
 
 @app.get("/sincronizacao", response_class=HTMLResponse)
 def sincronizacao(request: Request) -> str:
-    conn = get_connection()
-    try:
-        run_migrations(conn)
-        d = load_sync_data(conn)
-    finally:
-        conn.close()
-    return shell("/sincronizacao", "Sincronização",
-                 _sync_banner(request.query_params) + page_sync(d))
+    return _render("/sincronizacao", "Sincronização", page_sync,
+                   _sync_banner(request.query_params), loader=load_sync_data)
 
 
 @app.get("/exportar", response_class=HTMLResponse)
@@ -1104,17 +1153,15 @@ def _plan_result_html(result: dict[str, Any]) -> str:
     return "".join(parts)
 
 
-def _page_import(form_html: str, result_html: str, banner: str = "") -> str:
-    return (f'{banner}<div class="pagehead"><p class="eyebrow">Import</p><h1>Importar plano</h1>'
+def _page_import(form_html: str, result_html: str) -> str:
+    return ('<div class="pagehead"><p class="eyebrow">Import</p><h1>Importar plano</h1>'
             '<p class="sub">Cole o plano do coach; o verificador aprova ou bloqueia antes de gravar.</p>'
             f'</div>{form_html}{result_html}')
 
 
 @app.get("/importar", response_class=HTMLResponse)
-def importar_get(request: Request) -> str:
-    banner = (_banner("ok", "Plano aprovado", "Está ativo — o painel vai rastrear planejado vs. real.")
-              if request.query_params.get("ok") == "1" else "")
-    return shell("/relatorios", "Importar", _page_import(_import_form(), "", banner))
+def importar_get() -> str:
+    return shell("/relatorios", "Importar", _page_import(_import_form(), ""))
 
 
 @app.post("/importar", response_class=HTMLResponse)
@@ -1122,7 +1169,6 @@ def importar_post(plan: str = Form("")) -> str:
     from coach import plan_import
     conn = get_connection()
     try:
-        run_migrations(conn)
         try:
             result = plan_import.import_plan(conn, plan)
             res_html = _plan_result_html(result)
@@ -1139,16 +1185,18 @@ def importar_post(plan: str = Form("")) -> str:
 
 @app.post("/importar/aprovar")
 def importar_aprovar(request: Request) -> RedirectResponse:
-    from coach import plan_import
+    from coach import matching, plan_import
     pid = request.query_params.get("id")
+    approved = False
     if pid and pid.isdigit():
         conn = get_connection()
         try:
-            run_migrations(conn)
-            plan_import.approve_plan(conn, int(pid))
+            approved = plan_import.approve_plan(conn, int(pid))
+            if approved:  # track it right away (e.g. a past week), not only after the next sync
+                matching.apply_matching(conn)
         finally:
             conn.close()
-    return RedirectResponse(url="/importar?ok=1", status_code=303)
+    return RedirectResponse(url=f"/relatorios?aprovado={int(approved)}", status_code=303)
 
 
 
