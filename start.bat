@@ -1,6 +1,6 @@
 @echo off
-rem Inicia o painel local e abre no navegador. Duplo-clique para usar.
-rem %~dp0 = a pasta deste arquivo, entao funciona mesmo se o projeto mudar de lugar.
+rem Starts the local dashboard and opens it in the browser. Double-click to use.
+rem %~dp0 = this file's folder, so it still works if the project is moved.
 cd /d "%~dp0"
 start "Coach - painel" cmd /k venv\Scripts\python.exe -m coach.web
 timeout /t 2 >nul
