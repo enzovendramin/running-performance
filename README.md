@@ -1,5 +1,7 @@
 # Running Performance
 
+[![tests](https://github.com/enzovendramin/running-performance/actions/workflows/tests.yml/badge.svg)](https://github.com/enzovendramin/running-performance/actions/workflows/tests.yml)
+
 Personal running dashboard for a single athlete, integrated with Garmin Connect. It turns
 your Garmin data into training-load metrics, planned-vs-actual tracking, and recovery/risk
 signals — all local and private.
