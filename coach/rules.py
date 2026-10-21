@@ -53,6 +53,18 @@ def is_running(workout_type: str | None) -> bool:
     return not is_rest(workout_type) and not is_support(workout_type)
 
 
+# --- Intensity zone of a run by its average HR (dashboard + snapshot) ---
+EASY_HR_BELOW = 145  # average HR under this = easy
+MOD_HR_MAX = 165     # up to this = moderate; above = hard
+
+
+def intensity_zone(avg_hr: float | None) -> str | None:
+    """'easy' / 'mod' / 'hard' from a run's average HR, or None without HR data."""
+    if avg_hr is None:
+        return None
+    return "easy" if avg_hr < EASY_HR_BELOW else ("mod" if avg_hr <= MOD_HR_MAX else "hard")
+
+
 # --- Athlete phase (drives how conservative the plan rules are) ---
 RETURN_CTL_MAX = 20.0        # below this fitness => "return" phase (conservative)
 MIN_BASELINE_M = 15_000.0    # below this weekly baseline, skip volume-jump rules (return phase)
@@ -74,14 +86,16 @@ class PlanLimits:
     soft_max_long_share: float        # SOFT: long run as fraction of weekly distance
 
 
+# The hard volume cap reuses the alert engine's week-jump ratio: a plan that grows the
+# week by more than the alerts tolerate in reality is blocked before it is saved.
 RETURN_LIMITS = PlanLimits(
     min_rest_days=2, max_quality_days=1, allow_back_to_back_quality=False,
-    hard_weekly_jump=1.5, soft_weekly_jump=1.10,
+    hard_weekly_jump=WEEK_JUMP_RATIO, soft_weekly_jump=1.10,
     soft_max_quality_share=0.10, soft_max_long_share=0.35,
 )
 BUILDING_LIMITS = PlanLimits(
     min_rest_days=1, max_quality_days=2, allow_back_to_back_quality=False,
-    hard_weekly_jump=1.5, soft_weekly_jump=1.15,
+    hard_weekly_jump=WEEK_JUMP_RATIO, soft_weekly_jump=1.15,
     soft_max_quality_share=0.20, soft_max_long_share=0.35,
 )
 

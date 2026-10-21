@@ -13,9 +13,9 @@ from __future__ import annotations
 import math
 import sqlite3
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
-from coach.db import get_connection
+from coach.db import get_connection, utcnow
 
 DEFAULT_REST_HR = 48
 DEFAULT_MAX_HR = 190
@@ -25,10 +25,6 @@ CTL_DAYS = 42
 ATL_DAYS = 7
 
 
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def banister_trimp(
     duration_s: float | None, avg_hr: float | None, rest_hr: int, max_hr: int
 ) -> float:
@@ -36,9 +32,7 @@ def banister_trimp(
     if not duration_s or not avg_hr:
         return 0.0
     hrr = (avg_hr - rest_hr) / max(max_hr - rest_hr, 1)
-    hrr = min(max(hrr, 0.0), 1.0)
-    if hrr <= 0:
-        return 0.0
+    hrr = min(max(hrr, 0.0), 1.0)  # an avg HR at/below rest gives hrr 0 -> TRIMP 0
     duration_min = duration_s / 60.0
     factor = 0.86 * math.exp(1.67 * hrr) if SEX == "F" else 0.64 * math.exp(1.92 * hrr)
     return duration_min * hrr * factor
@@ -89,7 +83,7 @@ def rebuild_load(
     start = date.fromisoformat(min(daily))
     end = date.today()
     ctl = atl = 0.0
-    now = _utcnow()
+    now = utcnow()
     out: list[tuple[str, float, float, float, float, str]] = []
     cur = start
     while cur <= end:
@@ -102,12 +96,12 @@ def rebuild_load(
         )
         cur += timedelta(days=1)
 
+    # Full rebuild: replace the whole series in one transaction, so no stale day from
+    # an older computation survives and readers never see a half-written series.
+    conn.execute("DELETE FROM daily_load")
     conn.executemany(
         "INSERT INTO daily_load (date, daily_load, ctl, atl, tsb, computed_at)"
-        " VALUES (?, ?, ?, ?, ?, ?)"
-        " ON CONFLICT(date) DO UPDATE SET daily_load=excluded.daily_load,"
-        " ctl=excluded.ctl, atl=excluded.atl, tsb=excluded.tsb,"
-        " computed_at=excluded.computed_at",
+        " VALUES (?, ?, ?, ?, ?, ?)",
         out,
     )
     conn.commit()

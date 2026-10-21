@@ -11,10 +11,10 @@ are starting points and tunable.
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
-from coach.db import get_connection
+from coach.db import get_connection, utcnow
 from coach.rules import (  # single source of truth for thresholds
     ACWR_HIGH,
     ACWR_MIN_CTL,
@@ -25,10 +25,6 @@ from coach.rules import (  # single source of truth for thresholds
     WEEK_JUMP_MIN_LOAD,
     WEEK_JUMP_RATIO,
 )
-
-
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _week_load(conn: sqlite3.Connection, start_iso: str, end_iso: str) -> float:
@@ -46,16 +42,23 @@ def _latest_load(conn: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def recovery_flags(conn: sqlite3.Connection) -> list[str]:
-    """Recent poor-recovery signals (last 3 days) vs the 30-day baseline."""
+def recovery_flags(conn: sqlite3.Connection, today: date | None = None) -> list[str]:
+    """Poor-recovery signals in the last 3 calendar days vs the 30-day baseline.
+
+    Windows are by date (not "the last 3 rows"), so after days without the watch an
+    old night never counts as recent.
+    """
+    today = today or date.today()
     flags: list[str] = []
     recent = conn.execute(
         "SELECT resting_hr, body_battery_high, sleep_seconds FROM daily_wellness"
-        " ORDER BY date DESC LIMIT 3"
+        " WHERE date > ? AND date <= ?",
+        ((today - timedelta(days=3)).isoformat(), today.isoformat()),
     ).fetchall()
     base = conn.execute(
         "SELECT AVG(resting_hr) AS rhr FROM daily_wellness"
-        " WHERE resting_hr IS NOT NULL AND date >= date('now','-30 days')"
+        " WHERE resting_hr IS NOT NULL AND date >= ? AND date <= ?",
+        ((today - timedelta(days=30)).isoformat(), today.isoformat()),
     ).fetchone()
     base_rhr = base["rhr"] if base and base["rhr"] else None
     for r in recent:
@@ -80,12 +83,12 @@ def evaluate(conn: sqlite3.Connection, today: date | None = None) -> list[dict[s
     prev_week = _week_load(conn, (today - timedelta(days=13)).isoformat(),
                            (today - timedelta(days=7)).isoformat())
     ctl, atl, tsb = latest["ctl"], latest["atl"], latest["tsb"]
-    recovery = recovery_flags(conn)
+    recovery = recovery_flags(conn, today)
     suffix = f" Recovery signals: {', '.join(recovery)}." if recovery else ""
     sev = "high" if recovery else "warning"
 
     # Rule 1: acute:chronic ratio (only above the base floor).
-    if ctl >= ACWR_MIN_CTL and ctl > 0 and atl / ctl >= ACWR_HIGH:
+    if ctl >= ACWR_MIN_CTL and atl / ctl >= ACWR_HIGH:
         ratio = atl / ctl
         alerts.append({
             "rule": "acwr_high", "severity": sev,
@@ -132,7 +135,7 @@ def persist_alerts(conn: sqlite3.Connection, alerts: list[dict[str, Any]]) -> in
         conn.execute(
             "INSERT INTO inbox_message (type, title, body, status, created_at)"
             " VALUES ('risk_alert', ?, ?, 'unread', ?)",
-            (a["title"], a["message"], _utcnow()),
+            (a["title"], a["message"], utcnow()),
         )
         created += 1
     conn.commit()

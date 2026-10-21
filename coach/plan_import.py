@@ -9,18 +9,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date, datetime, timezone
+from collections import defaultdict
+from datetime import date, timedelta
 from statistics import mean
 from typing import Any
 
 from coach import plan_verifier, rules
+from coach.db import utcnow
 
 BASE_TYPES = frozenset({"easy", "long", "recovery"})
 ALLOWED_TYPES = rules.REST_TYPES | rules.QUALITY_TYPES | rules.SUPPORT_TYPES | BASE_TYPES
-
-
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+BASELINE_WEEKS = 4  # completed weeks with runs that make up the volume baseline
 
 
 def _extract_json(text: str) -> str:
@@ -79,16 +78,26 @@ def parse_plan(text: str) -> dict[str, Any]:
     return plan
 
 
-def _state(conn: sqlite3.Connection) -> dict[str, Any]:
+def _state(conn: sqlite3.Connection, today: date | None = None) -> dict[str, Any]:
+    """Athlete state for the verifier: current CTL + baseline weekly running volume.
+
+    The baseline is the mean of the last BASELINE_WEEKS *completed* ISO weeks that had
+    runs. Weeks are keyed by (ISO year, week) and taken in date order, so the year
+    boundary and the unfinished current week can't distort it.
+    """
+    today = today or date.today()
     row = conn.execute("SELECT ctl FROM daily_load ORDER BY date DESC LIMIT 1").fetchone()
     ctl = row["ctl"] if row else None
-    weekly: dict[int, float] = {}
+    this_monday = today - timedelta(days=today.weekday())
+    weekly: dict[tuple[int, int], float] = defaultdict(float)
     for r in conn.execute(
-        "SELECT start_time_local, distance_m FROM activity WHERE type='running'"):
-        wk = date.fromisoformat(r["start_time_local"][:10]).isocalendar()[1]
-        weekly[wk] = weekly.get(wk, 0.0) + (r["distance_m"] or 0)
-    active = [m for m in weekly.values() if m > 0]
-    return {"ctl": ctl, "baseline_weekly_m": mean(active[-4:]) if active else None}
+            "SELECT start_time_local, distance_m FROM activity"
+            " WHERE type='running' AND start_time_local < ?", (this_monday.isoformat(),)):
+        iso_year, iso_week, _ = date.fromisoformat(r["start_time_local"][:10]).isocalendar()
+        weekly[(iso_year, iso_week)] += r["distance_m"] or 0
+    active = [weekly[k] for k in sorted(weekly) if weekly[k] > 0]
+    return {"ctl": ctl,
+            "baseline_weekly_m": mean(active[-BASELINE_WEEKS:]) if active else None}
 
 
 def verify(conn: sqlite3.Connection, plan: dict[str, Any]) -> plan_verifier.Verdict:
@@ -108,7 +117,7 @@ def import_plan(conn: sqlite3.Connection, text: str) -> dict[str, Any]:
     }
     if not verdict.ok:
         return result  # blocked: never persist an unverified plan
-    now, ws = _utcnow(), plan["week_start"]
+    now, ws = utcnow(), plan["week_start"]
     conn.execute("UPDATE weekly_plan SET status='superseded', updated_at=?"
                  " WHERE week_start_date=? AND status='proposed'", (now, ws))
     pid = conn.execute(
@@ -131,12 +140,15 @@ def import_plan(conn: sqlite3.Connection, text: str) -> dict[str, Any]:
 
 
 def approve_plan(conn: sqlite3.Connection, plan_id: int) -> bool:
-    """Flip a 'proposed' plan to 'active', superseding others for the same week."""
-    row = conn.execute("SELECT week_start_date FROM weekly_plan WHERE id=?",
-                       (plan_id,)).fetchone()
+    """Flip a 'proposed' plan to 'active', superseding others for the same week.
+
+    Only a pending proposal can be approved — an old superseded plan is never revived.
+    """
+    row = conn.execute("SELECT week_start_date FROM weekly_plan WHERE id=?"
+                       " AND status='proposed'", (plan_id,)).fetchone()
     if not row:
         return False
-    now, ws = _utcnow(), row["week_start_date"]
+    now, ws = utcnow(), row["week_start_date"]
     conn.execute("UPDATE weekly_plan SET status='superseded', updated_at=?"
                  " WHERE week_start_date=? AND status IN ('active','proposed') AND id!=?",
                  (now, ws, plan_id))

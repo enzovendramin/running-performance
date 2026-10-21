@@ -12,7 +12,8 @@ MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 DEFAULT_DB_PATH = PROJECT_ROOT / "coach.db"
 
 
-def _utcnow() -> str:
+def utcnow() -> str:
+    """Current UTC time as an ISO-8601 string (the timestamp format used in every table)."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -64,18 +65,29 @@ def _discover_migrations(migrations_dir: Path) -> list[tuple[int, Path]]:
 def run_migrations(
     conn: sqlite3.Connection, migrations_dir: Path = MIGRATIONS_DIR
 ) -> list[int]:
-    """Apply pending migrations in order. Return the versions applied now."""
+    """Apply pending migrations in order. Return the versions applied now.
+
+    Each migration and its schema_migrations record run in ONE transaction: if any
+    statement fails, the whole migration rolls back, so the DB is never left
+    half-migrated (SQLite DDL is transactional).
+    """
     already = applied_versions(conn)
     newly: list[int] = []
     for version, path in _discover_migrations(migrations_dir):
         if version in already:
             continue
-        conn.executescript(path.read_text(encoding="utf-8"))
-        conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-            (version, _utcnow()),
-        )
-        conn.commit()
+        try:
+            # executescript() commits any open transaction first, then runs the script
+            # as-is — the explicit BEGIN keeps the migration open until our COMMIT.
+            conn.executescript("BEGIN;\n" + path.read_text(encoding="utf-8"))
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (version, utcnow()),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            raise
         newly.append(version)
     return newly
 

@@ -11,10 +11,12 @@ import json
 import os
 import sqlite3
 import sys
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from statistics import mean
 
+from coach import rules
 from coach.db import PROJECT_ROOT, get_connection, run_migrations
 from coach.load import DEFAULT_REST_HR, banister_trimp
 
@@ -47,10 +49,11 @@ def _hm(sec) -> str:
     return f"{sec // 3600}h{(sec % 3600) // 60:02d}"
 
 
+ZONE_PT = {"easy": "fácil", "mod": "moderado", "hard": "forte"}
+
+
 def _zone(hr: int | None) -> str:
-    if hr is None:
-        return "—"
-    return "fácil" if hr < 145 else ("moderado" if hr <= 165 else "forte")
+    return ZONE_PT.get(rules.intensity_zone(hr) or "", "—")
 
 
 def _fc_zones(conn: sqlite3.Connection) -> str:
@@ -71,12 +74,6 @@ def _fc_zones(conn: sqlite3.Connection) -> str:
 CROSS_PT = {"strength_training": "força", "cycling": "bike", "indoor_cycling": "bike",
             "lap_swimming": "natação", "open_water_swimming": "natação",
             "walking": "caminhada", "hiking": "caminhada"}
-
-
-def _zk(hr: int | None) -> str | None:
-    if hr is None:
-        return None
-    return "easy" if hr < 145 else ("mod" if hr <= 165 else "hard")
 
 
 def _atypical(well: list[dict]) -> str:
@@ -203,15 +200,14 @@ def build_snapshot(conn: sqlite3.Connection) -> str:
     cross = [a for a in acts if a["type"] != "running"]
 
     # ---- Semanal (6 semanas) ----
-    from collections import defaultdict
-    yr = runs[-1]["d"].year if runs else date.today().year
-    wk: dict[int, dict] = defaultdict(
+    # keyed by (ISO year, ISO week) so weeks of different years never merge
+    wk: dict[tuple[int, int], dict] = defaultdict(
         lambda: {"km": 0.0, "runs": 0, "easy": 0.0, "mod": 0.0, "hard": 0.0, "forca": 0, "cross": 0})
     for a in acts:
-        b = wk[a["d"].isocalendar()[1]]
+        b = wk[a["d"].isocalendar()[:2]]
         if a["type"] == "running":
             b["km"] += a["km"]; b["runs"] += 1
-            z = _zk(a["avg_hr"])
+            z = rules.intensity_zone(a["avg_hr"])
             if z:
                 b[z] += a["km"]
         elif "strength" in a["type"]:
@@ -219,9 +215,9 @@ def build_snapshot(conn: sqlite3.Connection) -> str:
         else:
             b["cross"] += 1
     P("\n## SEMANAL (últimas 6 semanas com atividade)")
-    for n in sorted(wk)[-6:]:
-        b = wk[n]
-        end = date.fromisocalendar(yr, n, 7)
+    for y, n in sorted(wk)[-6:]:
+        b = wk[(y, n)]
+        end = date.fromisocalendar(y, n, 7)
         P(f"  Semana {n} (fim {_dm(end)}): {b['km']:.0f} km · {b['runs']} corr · "
           f"fácil {b['easy']:.0f}/mod {b['mod']:.0f}/forte {b['hard']:.0f} km · "
           f"força {b['forca']} · cross {b['cross']}")
@@ -260,13 +256,32 @@ def build_snapshot(conn: sqlite3.Connection) -> str:
         P("  (nenhuma sessão de força/cross registrada)")
 
     # ---- Planejado vs realizado ----
-    P("\n## PLANEJADO vs REALIZADO (semana corrente)")
-    plan = conn.execute("SELECT id FROM weekly_plan WHERE status IN ('active','proposed')"
-                        " ORDER BY created_at DESC LIMIT 1").fetchone()
-    if plan:
-        P("  (há plano ativo — o comparativo detalhado entra quando o coach.import estiver pronto)")
+    # statuses come from coach.matching (run by coach.daily after each sync)
+    P("\n## PLANEJADO vs REALIZADO (último plano aprovado)")
+    plan = conn.execute(
+        "SELECT id, week_start_date FROM weekly_plan WHERE status IN ('active','completed')"
+        " ORDER BY week_start_date DESC, id DESC LIMIT 1").fetchone()
+    if not plan:
+        P("  Nenhum plano aprovado no painel.")
     else:
-        P("  Sem plano ativo no painel (o import de plano ainda não está implementado).")
+        ws = date.fromisoformat(plan["week_start_date"])
+        this_monday = date.today() - timedelta(days=date.today().weekday())
+        P(f"  Semana de {_dm(ws)}" + ("" if ws == this_monday
+                                     else " — não há plano para a semana atual"))
+        status_pt = {"completed": "feito", "modified": "feito, distância bem diferente",
+                     "skipped": "não feito", "planned": "a fazer"}
+        for w in conn.execute(
+                "SELECT pw.date, pw.type, pw.target_distance_m, pw.status,"
+                " (SELECT a.distance_m FROM activity a WHERE a.planned_workout_id = pw.id)"
+                " AS real_m FROM planned_workout pw WHERE pw.weekly_plan_id = ?"
+                " ORDER BY pw.date", (plan["id"],)):
+            alvo = f" {w['target_distance_m'] / 1000:g} km" if w["target_distance_m"] else ""
+            if not rules.is_running(w["type"]):  # rest/support days aren't tracked
+                P(f"  {w['date']}: {w['type']}{alvo}")
+                continue
+            real = f" (real {w['real_m'] / 1000:.1f} km)" if w["real_m"] else ""
+            P(f"  {w['date']}: {w['type']}{alvo} → "
+              f"{status_pt.get(w['status'], w['status'])}{real}")
 
     # ---- Alertas ----
     P("\n## ALERTAS / RECUPERAÇÃO")

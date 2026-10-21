@@ -1,4 +1,4 @@
--- 001_init.sql — initial schema (Phase 1). See docs/SCHEMA_PROPOSAL.md.
+-- 001_init.sql — initial schema (Phase 1). See the data model in PROJECT_SPEC.md.
 -- Idempotent (IF NOT EXISTS) so it is safe to re-run.
 
 PRAGMA foreign_keys = ON;
@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS daily_load (
     daily_load  REAL NOT NULL,   -- sum of the day's load
     ctl         REAL NOT NULL,   -- Fitness (42d EWMA)
     atl         REAL NOT NULL,   -- Fatigue (7d EWMA)
-    tsb         REAL NOT NULL,   -- Form = yesterday's ctl - atl
+    tsb         REAL NOT NULL,   -- Form = ctl - atl (same day)
     computed_at TEXT NOT NULL
 );
 

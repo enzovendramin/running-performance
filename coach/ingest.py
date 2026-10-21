@@ -12,13 +12,9 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from coach import garmin
-from coach.db import get_connection
+from coach.db import get_connection, utcnow
 
 ESCALATION_THRESHOLD = 3  # consecutive failures before warning the user
-
-
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _to_utc_iso(gmt_str: str | None) -> str | None:
@@ -164,8 +160,7 @@ def _enrich_activities(conn: sqlite3.Connection, client: Any, now: str) -> int:
     for r in rows:
         aid = r["garmin_activity_id"]
         try:
-            zones = client.get_activity_hr_in_timezones(aid) or []
-            splits = client.get_activity_splits(aid) or {}
+            zones, splits = garmin.fetch_activity_details(client, aid)
         except Exception:
             continue  # leave NULL, retry next sync
         hz = [{"zone": z.get("zoneNumber"), "secs": z.get("secsInZone"),
@@ -290,7 +285,7 @@ def _log_sync(
     conn.execute(
         "INSERT INTO sync_log (ran_at, status, source, detail, activities_fetched)"
         " VALUES (?, ?, 'garmin_sync', ?, ?)",
-        (_utcnow(), status, detail, count),
+        (utcnow(), status, detail, count),
     )
     conn.commit()
 
@@ -313,7 +308,7 @@ def _maybe_escalate(conn: sqlite3.Connection, threshold: int = ESCALATION_THRESH
         (
             "Can't reach Garmin",
             f"The sync failed {threshold} times in a row. Can you check the login/connection?",
-            _utcnow(),
+            utcnow(),
         ),
     )
     conn.commit()
@@ -347,7 +342,7 @@ def sync(days: int = 120, wellness_days: int = 60,
     try:
         try:
             client = garmin.connect()
-            now = _utcnow()
+            now = utcnow()
 
             activities = garmin.fetch_activities(client, days=days)
             processed = 0

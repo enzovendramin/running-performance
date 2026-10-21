@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import os
 from datetime import date, timedelta
-from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from coach.db import PROJECT_ROOT
+
+
 TOKENSTORE = PROJECT_ROOT / ".garmintokens"
 
 
@@ -78,6 +79,16 @@ def fetch_wellness(
             sleep = {}
         out.append((day, summary, sleep))
     return out
+
+
+def fetch_activity_details(
+    client: Any, activity_id: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Per-run HR time-in-zone + splits (laps). Raises on failure so the caller can
+    leave the run un-enriched and retry on the next sync."""
+    zones = client.get_activity_hr_in_timezones(activity_id) or []
+    splits = client.get_activity_splits(activity_id) or {}
+    return zones, splits
 
 
 def fetch_race_predictions(client: Any) -> dict[str, Any] | None:

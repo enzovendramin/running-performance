@@ -9,8 +9,10 @@ Rules (1-day tolerance, approved):
 - A plan with no match, once its date + tolerance has passed, becomes `skipped`.
 - A matched plan whose actual distance is far from target becomes `modified`, else
   `completed`.
+- Only workouts of APPROVED plans take part (a superseded or proposed plan never
+  claims a run), and only running workouts are tracked — rest and support
+  (strength/mobility/cross) days stay `planned`.
 
-Dormant until plans exist, but built and tested now.
 The core (`compute_matches`) is a pure function for easy testing.
 """
 
@@ -18,14 +20,13 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any
 
+from coach import rules
+from coach.db import utcnow
+
 MODIFIED_DISTANCE_RATIO = 0.4  # actual differs from target by more than this -> "modified"
-
-
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _date_diff(a_iso: str, b_iso: str) -> int:
@@ -89,16 +90,24 @@ def is_modified(target_distance_m: float | None, actual_distance_m: float | None
 def apply_matching(
     conn: sqlite3.Connection, tolerance_days: int = 1, today: date | None = None
 ) -> dict[str, int]:
-    """Read plans + activities, link them, and update statuses. Returns a summary."""
+    """Rebuild the plan<->activity links and the workout statuses from scratch.
+
+    Recomputed as a whole in one transaction (like the load series), so a link or
+    status from an older computation — or from a plan that has since been
+    superseded — never survives. Returns a summary.
+    """
     today = today or date.today()
     plans = [
-        {"id": r["id"], "date": r["date"], "type": "running",
-         "target_distance_m": r["target_distance_m"], "status": r["status"]}
+        {"id": r["id"], "date": r["date"],
+         # compute_matches pairs runs with "running" plans; rest/support aren't tracked
+         "type": "running" if rules.is_running(r["type"]) else r["type"],
+         "target_distance_m": r["target_distance_m"]}
         for r in conn.execute(
-            "SELECT id, date, type, target_distance_m, status FROM planned_workout"
+            "SELECT pw.id, pw.date, pw.type, pw.target_distance_m FROM planned_workout pw"
+            " JOIN weekly_plan wp ON wp.id = pw.weekly_plan_id"
+            " WHERE wp.status IN ('active', 'completed')"
         ).fetchall()
     ]
-    # planned_workout.type is a workout type ('easy'/'long'/...), all running; treat as running.
     acts = [
         {"id": r["id"], "date": (r["start_time_local"] or "")[:10], "type": r["type"],
          "distance_m": r["distance_m"]}
@@ -109,11 +118,14 @@ def apply_matching(
     plan_by_id = {p["id"]: p for p in plans}
     act_by_id = {a["id"]: a for a in acts}
 
-    matches = compute_matches(
-        [{**p, "type": "running"} for p in plans], acts, tolerance_days
-    )
+    matches = compute_matches(plans, acts, tolerance_days)
 
-    now = _utcnow()
+    now = utcnow()
+    # start from a clean slate, then write the fresh result (one transaction)
+    conn.execute("UPDATE activity SET planned_workout_id = NULL"
+                 " WHERE planned_workout_id IS NOT NULL")
+    conn.execute("UPDATE planned_workout SET status = 'planned', updated_at = ?"
+                 " WHERE status != 'planned'", (now,))
     linked = 0
     for activity_id, plan_id in matches.items():
         conn.execute(
@@ -131,12 +143,11 @@ def apply_matching(
     matched_plan_ids = set(matches.values())
     skipped = 0
     for p in plans:
-        if p["id"] in matched_plan_ids:
+        if p["type"] != "running" or p["id"] in matched_plan_ids:
             continue
         if _date_diff(today.isoformat(), p["date"]) > tolerance_days:
             conn.execute(
-                "UPDATE planned_workout SET status = 'skipped', updated_at = ? WHERE id = ?"
-                " AND status = 'planned'",
+                "UPDATE planned_workout SET status = 'skipped', updated_at = ? WHERE id = ?",
                 (now, p["id"]),
             )
             skipped += 1
